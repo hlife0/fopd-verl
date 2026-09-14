@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -149,6 +150,10 @@ class PPOTrainer(ABC):
         # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
         self.local_trigger_step = 0
         self._restored_tq_prompt_count = 0
+        self._trace_actor_start_ts = None
+        self._trace_actor_done_ts = None
+        self._trace_weights_start_ts = None
+        self._trace_weights_done_ts = None
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -471,6 +476,7 @@ class PPOTrainer(ABC):
                         self._save_checkpoint()
 
                 self.on_step_end()
+                self._dump_sample_trace(batch, self.timing_raw)
                 metrics.update(self._consume_sync_metrics())
 
             # 4. validate
@@ -558,6 +564,7 @@ class PPOTrainer(ABC):
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
+        self._record_gen_split_timing(batch, timing_raw)
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -592,10 +599,84 @@ class PPOTrainer(ABC):
 
         # 9. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
+            self._trace_actor_start_ts = time.time()
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
+            self._trace_actor_done_ts = time.time()
 
         return batch
+
+    def _record_gen_split_timing(self, batch: KVBatchMeta, timing_raw: dict) -> None:
+        """Split gen into student-generation span vs remaining teacher-score tail.
+
+        gen_student: first student generate start → last student generate finish.
+        gen_teacher: last student generate finish → last teacher score finish.
+        """
+        starts, student_dones, teacher_dones = [], [], []
+        for tag in batch.tags:
+            if tag.get("is_padding", False):
+                continue
+            if "student_gen_done_ts" not in tag or "teacher_done_ts" not in tag:
+                continue
+            student_done = float(tag["student_gen_done_ts"])
+            student_dones.append(student_done)
+            teacher_dones.append(float(tag["teacher_done_ts"]))
+            starts.append(float(tag.get("student_gen_start_ts", student_done)))
+        if not student_dones:
+            return
+        last_student = max(student_dones)
+        timing_raw["gen_student"] = last_student - min(starts)
+        timing_raw["gen_teacher"] = max(0.0, max(teacher_dones) - last_student)
+
+    def _dump_sample_trace(self, batch: KVBatchMeta, timing_raw: dict) -> None:
+        out_dir = os.environ.get("FOPD_SAMPLE_TRACE_DIR")
+        if not out_dir:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        samples = []
+        for i, tag in enumerate(batch.tags):
+            if tag.get("is_padding", False):
+                continue
+            samples.append(
+                {
+                    "index": i,
+                    "prompt_len": tag.get("prompt_len"),
+                    "response_len": tag.get("response_len"),
+                    "student_submit_ts": tag.get("student_submit_ts"),
+                    "student_first_token_ts": tag.get("student_first_token_ts"),
+                    "student_last_token_ts": tag.get("student_last_token_ts"),
+                    "engine_queue_s": tag.get("engine_queue_s"),
+                    "engine_prefill_s": tag.get("engine_prefill_s"),
+                    "engine_decode_s": tag.get("engine_decode_s"),
+                    "teacher_start_ts": tag.get("teacher_start_ts"),
+                    "teacher_done_ts": tag.get("teacher_done_ts"),
+                    "teacher_submit_ts": tag.get("teacher_submit_ts"),
+                    "teacher_first_token_ts": tag.get("teacher_first_token_ts"),
+                    "teacher_last_token_ts": tag.get("teacher_last_token_ts"),
+                    "teacher_engine_queue_s": tag.get("teacher_engine_queue_s"),
+                    "teacher_engine_prefill_s": tag.get("teacher_engine_prefill_s"),
+                    "teacher_engine_decode_s": tag.get("teacher_engine_decode_s"),
+                    "actor_start_ts": self._trace_actor_start_ts,
+                    "actor_done_ts": self._trace_actor_done_ts,
+                    "weights_start_ts": self._trace_weights_start_ts,
+                    "weights_done_ts": self._trace_weights_done_ts,
+                }
+            )
+        path = os.path.join(out_dir, f"step_{self.global_steps}_samples.json")
+        with open(path, "w") as fh:
+            json.dump(
+                {
+                    "step": self.global_steps,
+                    "n": len(samples),
+                    "timing_raw": {k: float(v) for k, v in timing_raw.items() if isinstance(v, (int, float))},
+                    "actor_start_ts": self._trace_actor_start_ts,
+                    "actor_done_ts": self._trace_actor_done_ts,
+                    "weights_start_ts": self._trace_weights_start_ts,
+                    "weights_done_ts": self._trace_weights_done_ts,
+                    "samples": samples,
+                },
+                fh,
+            )
 
     # ------------------------------ abstract methods ------------------------------
 

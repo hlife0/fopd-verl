@@ -119,7 +119,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
@@ -139,4 +139,4 @@ class AsyncTeacherLLMServerManager:
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
-        return teacher_ids, teacher_logprobs
+        return teacher_ids, teacher_logprobs, teacher_output.extra_fields

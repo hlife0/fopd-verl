@@ -18,6 +18,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import ray
@@ -157,9 +158,29 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
+        last = outputs[-1]
+        extra = last.extra_fields if isinstance(last.extra_fields, dict) else {}
+        student_submit_ts = extra.get("student_submit_ts")
+        student_first_token_ts = extra.get("student_first_token_ts")
+        student_last_token_ts = extra.get("student_last_token_ts")
+        engine_queue_s = extra.get("engine_queue_s")
+        engine_prefill_s = extra.get("engine_prefill_s")
+        engine_decode_s = extra.get("engine_decode_s")
+        student_gen_done_ts = time.time()
+        gen_dur = 0.0
+        metrics = last.metrics
+        if isinstance(metrics, dict):
+            gen_dur = float(metrics.get("generate_sequences", 0.0) or 0.0)
+        else:
+            gen_dur = float(getattr(metrics, "generate_sequences", 0.0) or 0.0)
+        student_gen_start_ts = (
+            float(student_submit_ts) if student_submit_ts is not None else student_gen_done_ts - gen_dur
+        )
+
         await self._compute_score(outputs, kwargs=kwargs)
 
-        final_output = outputs[-1]
+        final_output = last
+        teacher_start_ts = time.time()
         # TODO: Support output:list[AgentLoopOutput]
         await self._compute_teacher_logprobs(
             final_output,
@@ -168,6 +189,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             validate=validate,
             sample_kwargs=kwargs,
         )
+        teacher_done_ts = time.time()
+        extra = last.extra_fields if isinstance(last.extra_fields, dict) else extra
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
@@ -216,6 +239,22 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    "student_gen_start_ts": student_gen_start_ts,
+                    "student_gen_done_ts": student_gen_done_ts,
+                    "student_submit_ts": student_submit_ts,
+                    "student_first_token_ts": student_first_token_ts,
+                    "student_last_token_ts": student_last_token_ts,
+                    "engine_queue_s": engine_queue_s,
+                    "engine_prefill_s": engine_prefill_s,
+                    "engine_decode_s": engine_decode_s,
+                    "teacher_start_ts": teacher_start_ts,
+                    "teacher_done_ts": teacher_done_ts,
+                    "teacher_submit_ts": extra.get("teacher_submit_ts"),
+                    "teacher_first_token_ts": extra.get("teacher_first_token_ts"),
+                    "teacher_last_token_ts": extra.get("teacher_last_token_ts"),
+                    "teacher_engine_queue_s": extra.get("teacher_engine_queue_s"),
+                    "teacher_engine_prefill_s": extra.get("teacher_engine_prefill_s"),
+                    "teacher_engine_decode_s": extra.get("teacher_engine_decode_s"),
                 }
             )
 

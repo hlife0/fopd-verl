@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import time
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.utils.debug import marked_timer
@@ -33,9 +34,11 @@ class PPOTrainerSync(PPOTrainer):
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_step_end(self):
+        self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
             self.checkpoint_manager.update_weights(self.global_steps)
+        self._trace_weights_done_ts = time.time()
 
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache

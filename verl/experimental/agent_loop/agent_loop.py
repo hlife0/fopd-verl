@@ -1014,7 +1014,7 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+            teacher_ids, teacher_logprobs, teacher_extra = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
@@ -1022,6 +1022,13 @@ class AgentLoopWorker:
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            if isinstance(teacher_extra, dict):
+                output.extra_fields["teacher_submit_ts"] = teacher_extra.get("student_submit_ts")
+                output.extra_fields["teacher_first_token_ts"] = teacher_extra.get("student_first_token_ts")
+                output.extra_fields["teacher_last_token_ts"] = teacher_extra.get("student_last_token_ts")
+                output.extra_fields["teacher_engine_queue_s"] = teacher_extra.get("engine_queue_s")
+                output.extra_fields["teacher_engine_prefill_s"] = teacher_extra.get("engine_prefill_s")
+                output.extra_fields["teacher_engine_decode_s"] = teacher_extra.get("engine_decode_s")
 
     def _postprocess(
         self,

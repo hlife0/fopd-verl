@@ -676,18 +676,43 @@ class vLLMHttpServer:
             # Get final response
             final_res: Optional[RequestOutput] = None
             admitted = False
+            student_submit_ts = time.time()
+            student_first_token_ts = None
             try:
                 async for output in generator:
                     if not admitted:
                         admitted = True
                         self._admitting -= 1
+                    if student_first_token_ts is None and output.outputs and output.outputs[0].token_ids:
+                        student_first_token_ts = time.time()
                     final_res = output
             finally:
                 if not admitted:
                     self._admitting -= 1
             assert final_res is not None
+            student_last_token_ts = time.time()
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {
+            "global_steps": self.global_steps,
+            "student_submit_ts": student_submit_ts,
+            "student_first_token_ts": student_first_token_ts or student_last_token_ts,
+            "student_last_token_ts": student_last_token_ts,
+        }
+        metrics = getattr(final_res, "metrics", None)
+        if metrics is not None:
+            arrival_ts = getattr(metrics, "arrival_time", None)
+            queued_ts = float(getattr(metrics, "queued_ts", 0.0) or 0.0)
+            scheduled_ts = float(getattr(metrics, "scheduled_ts", 0.0) or 0.0)
+            first_ts = float(getattr(metrics, "first_token_ts", 0.0) or 0.0)
+            last_ts = float(getattr(metrics, "last_token_ts", 0.0) or 0.0)
+            if arrival_ts:
+                extra_fields["engine_arrival_ts"] = float(arrival_ts)
+            if scheduled_ts > 0.0 and queued_ts > 0.0 and scheduled_ts >= queued_ts:
+                extra_fields["engine_queue_s"] = scheduled_ts - queued_ts
+            if scheduled_ts > 0.0 and first_ts > 0.0 and first_ts >= scheduled_ts:
+                extra_fields["engine_prefill_s"] = first_ts - scheduled_ts
+            if first_ts > 0.0 and last_ts > 0.0 and last_ts >= first_ts:
+                extra_fields["engine_decode_s"] = last_ts - first_ts
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".

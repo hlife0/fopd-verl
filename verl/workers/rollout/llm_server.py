@@ -307,6 +307,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
+            if output.extra_fields:
+                final_output.extra_fields.update(output.extra_fields)
 
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:
