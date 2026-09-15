@@ -524,31 +524,43 @@ def build_mtp_speculative_config(
     }
 
 
+def extract_topk_from_logprobs_dict(logprobs_dict, num_logprobs: int) -> tuple[list[int], list[float]]:
+    """Pack a vLLM logprobs dict into rank-aligned top-k id / logprob rows."""
+    if not logprobs_dict or num_logprobs <= 0:
+        token_id = next(iter(logprobs_dict)) if logprobs_dict else 0
+        logprob = logprobs_dict[token_id].logprob if logprobs_dict else 0.0
+        return [int(token_id)], [float(logprob)]
+    prompt_ids = [0] * num_logprobs
+    prompt_logprobs = [0.0] * num_logprobs
+    for token_id_str, token_logprob in logprobs_dict.items():
+        rank = token_logprob.rank
+        if rank is None or rank > num_logprobs:
+            continue
+        prompt_ids[rank - 1] = int(token_id_str)
+        prompt_logprobs[rank - 1] = token_logprob.logprob
+    return prompt_ids, prompt_logprobs
+
+
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
     """Extract prompt log probabilities from generation output."""
-    if num_prompt_logprobs is None:
+    if num_prompt_logprobs is None or output.prompt_logprobs is None:
         return
 
     prompt_logprobs_ls, prompt_ids_ls = [], []
-    # NOTE: logprob of first prompt token is None.
+    # NOTE: logprob of first prompt token is None. Cached prefix positions may
+    # also be None / empty when skip_reading_prefix_cache=False; skip those so
+    # the remaining rows are the newly computed suffix.
     for logprobs_dict in output.prompt_logprobs[1:]:
+        if not logprobs_dict:
+            continue
         if num_prompt_logprobs == 0:
             token_id_str = list(logprobs_dict.keys())[0]
             logprob = logprobs_dict[token_id_str].logprob
             prompt_logprobs_ls.append([logprob])
             prompt_ids_ls.append([int(token_id_str)])
         else:
-            prompt_ids = [None] * num_prompt_logprobs
-            prompt_logprobs = [None] * num_prompt_logprobs
-            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
             assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
-            for token_id_str, token_logprob in logprobs_dict.items():
-                rank = token_logprob.rank
-                if rank > num_prompt_logprobs:
-                    continue  # the sampled token is not in the top-k
-                logprob = token_logprob.logprob
-                prompt_ids[rank - 1] = int(token_id_str)
-                prompt_logprobs[rank - 1] = logprob
+            prompt_ids, prompt_logprobs = extract_topk_from_logprobs_dict(logprobs_dict, num_prompt_logprobs)
             prompt_logprobs_ls.append(prompt_logprobs)
             prompt_ids_ls.append(prompt_ids)
 

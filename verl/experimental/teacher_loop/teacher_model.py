@@ -29,6 +29,33 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _configure_teacher_follow_replicas(replicas, rollout_config, distillation_config) -> None:
+    """Enable follow-only engine settings on Teacher replicas.
+
+    Batch-invariant attention keeps growing prefixes numerically closer to a
+    one-shot of the finished sequence. The KV floor is needed because follow
+    retains live prefixes; the student-copied gpu_memory_utilization is often
+    too small. Override via distillation.teacher_follow_min_gpu_memory_utilization
+    or teacher engine_kwargs.vllm.gpu_memory_utilization.
+    """
+    for replica in replicas:
+        replica.teacher_follow = True
+    min_util = float(distillation_config.teacher_follow_min_gpu_memory_utilization)
+    engine_kwargs = getattr(rollout_config, "engine_kwargs", None)
+    if engine_kwargs is None:
+        return
+    vllm_ek = engine_kwargs.setdefault("vllm", {})
+    current = float(vllm_ek.get("gpu_memory_utilization") or getattr(rollout_config, "gpu_memory_utilization", 0) or 0)
+    if current < min_util:
+        vllm_ek["gpu_memory_utilization"] = min_util
+        logger.warning(
+            "teacher_follow raised Teacher gpu_memory_utilization from %.2f to %.2f "
+            "so prefix cache can hold live follow prefixes.",
+            current,
+            min_util,
+        )
+
+
 @auto_await
 async def _run_all(tasks: list[asyncio.Task]):
     await asyncio.gather(*tasks)
@@ -97,6 +124,8 @@ class TeacherModelManager:
             )
             for replica_rank in range(num_replicas)
         ]
+        if self.distillation_config.teacher_follow:
+            _configure_teacher_follow_replicas(self.rollout_replicas, rollout_config, self.distillation_config)
         split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
         assert len(split_resource_pools) == len(self.rollout_replicas)
         self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)

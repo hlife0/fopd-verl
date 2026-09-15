@@ -224,6 +224,15 @@ class DistillationConfig(BaseConfig):
 
     enabled (bool):
         Whether on-policy distillation is enabled.
+    teacher_follow (bool):
+        When true, Teacher follows each Student sequence (one in-flight request;
+        snapshot the current prefix when the previous request ends; score only
+        the new suffix). When false, keep the current full-sample then one
+        Teacher call.
+    teacher_follow_min_gpu_memory_utilization (float):
+        Floor for Teacher vLLM gpu_memory_utilization when follow is on.
+        Follow keeps live prefixes in KV; the student-copied default is often
+        too small. Ignored if the Teacher engine already sets a higher value.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -260,6 +269,8 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    teacher_follow: bool = False
+    teacher_follow_min_gpu_memory_utilization: float = 0.75
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)

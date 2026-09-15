@@ -41,6 +41,7 @@ from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
+from verl.experimental.teacher_loop.teacher_follow import TEACHER_FOLLOW_TRACE_KEYS
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -656,6 +657,7 @@ class PPOTrainer(ABC):
                     "teacher_engine_queue_s": tag.get("teacher_engine_queue_s"),
                     "teacher_engine_prefill_s": tag.get("teacher_engine_prefill_s"),
                     "teacher_engine_decode_s": tag.get("teacher_engine_decode_s"),
+                    **{key: tag.get(key) for key in TEACHER_FOLLOW_TRACE_KEYS},
                     "actor_start_ts": self._trace_actor_start_ts,
                     "actor_done_ts": self._trace_actor_done_ts,
                     "weights_start_ts": self._trace_weights_start_ts,

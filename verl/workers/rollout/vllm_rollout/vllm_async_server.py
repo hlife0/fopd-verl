@@ -68,6 +68,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     build_cli_args_from_config,
     build_mtp_speculative_config,
     extract_prompt_logprobs,
+    extract_topk_from_logprobs_dict,
     get_vllm_max_lora_rank,
 )
 
@@ -75,6 +76,9 @@ _VLLM_VERSION = version.parse(vllm.__version__)
 
 # Max wait for admissions already past the submission gate to reach the engine.
 _GATE_BARRIER_TIMEOUT_S = 60.0
+# Stream Student tokens to the AgentLoop worker so Teacher can start before
+# generate() returns. Stride limits Ray RPC volume.
+_TOKEN_NOTIFY_STRIDE = 8
 
 if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
@@ -564,11 +568,15 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
+        token_notify_actor: Optional[ActorHandle] = None,
+        token_notify_key: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
+            token_notify_actor: Optional AgentLoop worker to stream decoded tokens.
+            token_notify_key: Key for ``notify_student_tokens`` on that actor.
         """
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
@@ -617,7 +625,14 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        # Student generate() passes logprobs as bool; Teacher follow passes an int width.
+        _logprobs = sampling_params.pop("logprobs", False)
+        if isinstance(_logprobs, bool):
+            sampling_params["logprobs"] = 0 if _logprobs else None
+        elif _logprobs is None:
+            sampling_params["logprobs"] = None
+        else:
+            sampling_params["logprobs"] = int(_logprobs)
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -685,6 +700,17 @@ class vLLMHttpServer:
                         self._admitting -= 1
                     if student_first_token_ts is None and output.outputs and output.outputs[0].token_ids:
                         student_first_token_ts = time.time()
+                    if (
+                        token_notify_actor is not None
+                        and token_notify_key is not None
+                        and output.outputs
+                        and output.outputs[0].token_ids
+                    ):
+                        n_tok = len(output.outputs[0].token_ids)
+                        if n_tok == 1 or n_tok % _TOKEN_NOTIFY_STRIDE == 0:
+                            token_notify_actor.notify_student_tokens.remote(
+                                token_notify_key, list(output.outputs[0].token_ids)
+                            )
                     final_res = output
             finally:
                 if not admitted:
@@ -733,6 +759,17 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        if (
+            sampling_params.logprobs is not None
+            and final_res.outputs
+            and final_res.outputs[0].logprobs
+        ):
+            decode_width = sampling_params.prompt_logprobs or sampling_params.logprobs
+            decode_ids, decode_lps = extract_topk_from_logprobs_dict(
+                final_res.outputs[0].logprobs[0], decode_width
+            )
+            extra_fields["decode_topk_ids"] = decode_ids
+            extra_fields["decode_topk_logprobs"] = decode_lps
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
@@ -1357,6 +1394,10 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+            # Teacher follow: batch-invariant attention so growing prefixes
+            # stay closer to a one-shot of the finished sequence.
+            if getattr(self, "teacher_follow", False):
+                env_vars["VLLM_BATCH_INVARIANT"] = "1"
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

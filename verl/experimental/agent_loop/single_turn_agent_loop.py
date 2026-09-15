@@ -58,6 +58,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         # 3. generate sequences
+        self.publish_student_prompt(prompt_ids, multi_modal_data, mm_processor_kwargs)
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
@@ -70,7 +71,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
+                **self.student_token_generate_kwargs(),
             )
+        self.publish_student_response(output.token_ids)
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
 

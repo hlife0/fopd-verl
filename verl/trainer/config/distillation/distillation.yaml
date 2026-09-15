@@ -13,6 +13,12 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Follow each Student sequence (one in-flight Teacher request, score suffix only).
+# Off = current baseline: full sample, then one Teacher call.
+teacher_follow: false
+# KV floor for Teacher vLLM when follow is on. Override per-engine if needed.
+teacher_follow_min_gpu_memory_utilization: 0.75
+
 # distillation loss config
 distillation_loss:
 

@@ -250,6 +250,36 @@ class AgentLoopBase(ABC):
             processor=self.processor,
         )
         self.loop = get_event_loop()
+        # Teacher follow (optional). AgentLoopWorkerTQ attaches these when
+        # distillation.teacher_follow is on; generate() is unchanged when None.
+        self.student_token_state = None
+        self.student_token_notify_key = None
+
+    def publish_student_prompt(
+        self,
+        prompt_ids: list[int],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if self.student_token_state is not None:
+            self.student_token_state.set_prompt(prompt_ids, multi_modal_data, mm_processor_kwargs)
+
+    def publish_student_response(self, token_ids: list[int]) -> None:
+        if self.student_token_state is not None:
+            self.student_token_state.update_response(token_ids)
+
+    def student_token_generate_kwargs(self) -> dict[str, Any]:
+        """Ray notify handle so Teacher can start before generate() returns."""
+        if self.student_token_notify_key is None:
+            return {}
+        try:
+            actor = ray.get_runtime_context().current_actor
+        except RuntimeError:
+            return {}
+        return {
+            "token_notify_actor": actor,
+            "token_notify_key": self.student_token_notify_key,
+        }
 
     def _assert_mm_supported(self, has_multi_modal: bool) -> None:
         """Fail loudly when multimodal inputs are present but unsupported.
@@ -661,8 +691,22 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            output: AgentLoopOutput = await self._invoke_agent_loop(
+                agent_loop, sampling_params, trajectory, agent_name=agent_name, **kwargs
+            )
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    async def _invoke_agent_loop(
+        self,
+        agent_loop,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        """Hook for Teacher follow. Default is one-shot generate(); TQ overrides."""
+        return await agent_loop.run(sampling_params, **kwargs)
 
     def _pad_token_ids(
         self,
@@ -1023,12 +1067,9 @@ class AgentLoopWorker:
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
             if isinstance(teacher_extra, dict):
-                output.extra_fields["teacher_submit_ts"] = teacher_extra.get("student_submit_ts")
-                output.extra_fields["teacher_first_token_ts"] = teacher_extra.get("student_first_token_ts")
-                output.extra_fields["teacher_last_token_ts"] = teacher_extra.get("student_last_token_ts")
-                output.extra_fields["teacher_engine_queue_s"] = teacher_extra.get("engine_queue_s")
-                output.extra_fields["teacher_engine_prefill_s"] = teacher_extra.get("engine_prefill_s")
-                output.extra_fields["teacher_engine_decode_s"] = teacher_extra.get("engine_decode_s")
+                from verl.experimental.teacher_loop.teacher_follow import copy_teacher_engine_timings
+
+                copy_teacher_engine_timings(output.extra_fields, teacher_extra)
 
     def _postprocess(
         self,

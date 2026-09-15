@@ -118,6 +118,11 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        # Notify kwargs are generate()-only; drop them before server acquire.
+        notify_kwargs = {}
+        if "token_notify_actor" in kwargs:
+            notify_kwargs["token_notify_actor"] = kwargs.pop("token_notify_actor")
+            notify_kwargs["token_notify_key"] = kwargs.pop("token_notify_key", None)
         server_id, server = await self._acquire_server(
             request_id,
             prompt_ids=prompt_ids,
@@ -147,6 +152,7 @@ class LLMServerClient:
                 video_data=video_data,
                 **multimodal_kwargs,
                 **priority_kwargs,
+                **notify_kwargs,
                 **kwargs,
             )
             global_steps = output.extra_fields.get("global_steps")

@@ -32,6 +32,11 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.teacher_loop.teacher_follow import (
+    TEACHER_FOLLOW_TRACE_KEYS,
+    StudentTokenState,
+    merge_teacher_extra,
+)
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -56,6 +61,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+        self._student_token_states: dict[str, StudentTokenState] = {}
+
+    def notify_student_tokens(self, key: str, token_ids: list[int]) -> None:
+        state = self._student_token_states.get(key)
+        if state is not None:
+            state.update_response(token_ids)
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
@@ -148,6 +159,65 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 await _settle_session_tasks(tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
+    def _teacher_follow_enabled(self, trajectory: dict, agent_name: str) -> bool:
+        if not self.distillation_enabled or trajectory.get("validate"):
+            return False
+        if agent_name != "single_turn_agent":
+            return False
+        manager = getattr(self, "teacher_server_manager", None)
+        return bool(manager is not None and manager.distillation_config.teacher_follow)
+
+    def _teacher_routing_key(self, sample_kwargs: dict) -> Any:
+        if not hasattr(self, "teacher_key"):
+            return None
+        routing_value = sample_kwargs.get(self.teacher_key)
+        if routing_value is None:
+            return None
+        return routing_value.item() if hasattr(routing_value, "item") else routing_value
+
+    async def _invoke_agent_loop(
+        self,
+        agent_loop,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        if not self._teacher_follow_enabled(trajectory, agent_name):
+            return await agent_loop.run(sampling_params, **kwargs)
+
+        uid, session_id = kwargs["uid"], kwargs["session_id"]
+        key = f"{uid}_{session_id}"
+        state = StudentTokenState()
+        self._student_token_states[key] = state
+        agent_loop.student_token_state = state
+        agent_loop.student_token_notify_key = key
+        follow_task = asyncio.create_task(
+            self.teacher_server_manager.compute_teacher_logprobs_follow(
+                state,
+                request_id=f"teacher-{key}",
+                routing_key=self._teacher_routing_key(kwargs),
+            )
+        )
+        try:
+            output = await agent_loop.run(sampling_params, **kwargs)
+            extra = output.extra_fields if isinstance(output.extra_fields, dict) else {}
+            extra["student_gen_done_ts"] = time.time()
+            output.extra_fields = extra
+            state.mark_done()
+            teacher_ids, teacher_logprobs, teacher_extra = await follow_task
+            extra["teacher_ids"] = teacher_ids
+            extra["teacher_logprobs"] = teacher_logprobs
+            merge_teacher_extra(extra, teacher_extra)
+            return output
+        except Exception:
+            follow_task.cancel()
+            await asyncio.gather(follow_task, return_exceptions=True)
+            raise
+        finally:
+            self._student_token_states.pop(key, None)
+
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
@@ -166,7 +236,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         engine_queue_s = extra.get("engine_queue_s")
         engine_prefill_s = extra.get("engine_prefill_s")
         engine_decode_s = extra.get("engine_decode_s")
-        student_gen_done_ts = time.time()
+        student_gen_done_ts = extra.get("student_gen_done_ts") or time.time()
         gen_dur = 0.0
         metrics = last.metrics
         if isinstance(metrics, dict):
@@ -180,17 +250,22 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = last
-        teacher_start_ts = time.time()
-        # TODO: Support output:list[AgentLoopOutput]
-        await self._compute_teacher_logprobs(
-            final_output,
-            prompt_ids=final_output.prompt_ids,
-            response_ids=final_output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
-        teacher_done_ts = time.time()
         extra = last.extra_fields if isinstance(last.extra_fields, dict) else extra
+        if extra.get("teacher_ids") is None:
+            teacher_start_ts = time.time()
+            # TODO: Support output:list[AgentLoopOutput]
+            await self._compute_teacher_logprobs(
+                final_output,
+                prompt_ids=final_output.prompt_ids,
+                response_ids=final_output.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
+            teacher_done_ts = time.time()
+            extra = last.extra_fields if isinstance(last.extra_fields, dict) else extra
+        else:
+            teacher_start_ts = extra.get("teacher_start_ts") or extra.get("teacher_submit_ts")
+            teacher_done_ts = extra.get("teacher_done_ts") or time.time()
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
@@ -255,6 +330,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "teacher_engine_queue_s": extra.get("teacher_engine_queue_s"),
                     "teacher_engine_prefill_s": extra.get("teacher_engine_prefill_s"),
                     "teacher_engine_decode_s": extra.get("teacher_engine_decode_s"),
+                    **{key: extra.get(key) for key in TEACHER_FOLLOW_TRACE_KEYS},
                 }
             )
 
