@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 import time
@@ -52,6 +53,17 @@ __all__ = [
     "_should_submit_follow",
     "_valid_teacher_rows",
 ]
+
+
+def _dump_follow_request_log(request_id: str, request_log: list[dict[str, Any]]) -> None:
+    out_dir = os.environ.get("FOPD_SAMPLE_TRACE_DIR")
+    if not out_dir or not request_log:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "teacher_requests.jsonl")
+    with open(path, "a") as fh:
+        for index, row in enumerate(request_log):
+            fh.write(json.dumps({"request_id": request_id, "request_index": index, **row}) + "\n")
 
 
 def _teacher_topk_width(distillation_loss_config: DistillationLossConfig) -> int:
@@ -307,6 +319,7 @@ class AsyncTeacherLLMServerManager:
         first_prefill_s = None
         last_cached = None
         last_prefill_s = None
+        request_log: list[dict[str, Any]] = []
 
         while True:
             seq = state.snapshot()
@@ -314,6 +327,8 @@ class AsyncTeacherLLMServerManager:
             if should_submit_follow(new_tokens, state.student_done, acc.scored_seq_len):
                 if teacher_start_ts is None:
                     teacher_start_ts = time.time()
+                scored_before = acc.scored_seq_len
+                submit_ts = time.time()
                 extra = await self._teacher_forward(
                     seq,
                     request_id=request_id,
@@ -328,6 +343,18 @@ class AsyncTeacherLLMServerManager:
                 last_prefill_s = extra.get("engine_prefill_s")
                 if first_prefill_s is None:
                     first_prefill_s = last_prefill_s
+                request_log.append(
+                    {
+                        "seq_len": len(seq),
+                        "new_tokens": int(new_tokens),
+                        "scored_before": int(scored_before),
+                        "num_cached": last_cached,
+                        "prefill_s": last_prefill_s,
+                        "submit_ts": submit_ts,
+                        "student_done": bool(state.student_done),
+                        "hole_fills": int(extra_calls),
+                    }
+                )
                 extra_out = extra
                 copy_teacher_engine_timings(extra_out, extra)
             elif state.student_done:
@@ -342,4 +369,6 @@ class AsyncTeacherLLMServerManager:
         extra_out["teacher_last_cached_tokens"] = last_cached
         extra_out["teacher_last_prefill_s"] = last_prefill_s
         extra_out["teacher_first_prefill_s"] = first_prefill_s
+        extra_out["teacher_requests"] = json.dumps(request_log)
+        _dump_follow_request_log(request_id, request_log)
         return teacher_ids, teacher_logprobs, extra_out
