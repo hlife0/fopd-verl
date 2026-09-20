@@ -139,6 +139,7 @@ class PPOTrainer(ABC):
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
+        self.opd_no_task_reward_fast_path = False
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -576,8 +577,9 @@ class PPOTrainer(ABC):
         batch = self._balance_batch(batch, metrics=metrics)
 
         # 4. compute old_log_prob
-        with marked_timer("old_log_prob", timing_raw, color="blue"):
-            batch = self._compute_old_log_prob(batch, metrics=metrics)
+        if not self.opd_no_task_reward_fast_path:
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                batch = self._compute_old_log_prob(batch, metrics=metrics)
 
         # 5. [OPTIONAL] compute ref_log_prob
         if self.use_reference_policy:
@@ -590,8 +592,9 @@ class PPOTrainer(ABC):
                 batch = self._compute_values(batch, metrics=metrics)
 
         # 7. compute advantage and return
-        with marked_timer("adv", timing_raw, color="brown"):
-            batch = self._compute_advantage(batch, metrics=metrics)
+        if not self.opd_no_task_reward_fast_path:
+            with marked_timer("adv", timing_raw, color="brown"):
+                batch = self._compute_advantage(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -1879,6 +1882,7 @@ class PPOTrainer(ABC):
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "opd_no_task_reward_fast_path": self.opd_no_task_reward_fast_path,
         }
         batch.extra_info.update(extra_info)
 
@@ -1898,12 +1902,12 @@ class PPOTrainer(ABC):
             "responses",
             "response_mask",
             "values",
-            "advantages",
-            "returns",
             "rm_scores",
             "token_level_rewards",
             "num_turns",
         ]
+        if not self.opd_no_task_reward_fast_path:
+            fields.extend(["advantages", "returns"])
         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
         data = get_metric_data_with_optional_routed_experts(
             keys=batch.keys,
@@ -1945,6 +1949,13 @@ class PPOTrainer(ABC):
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
             data["token_level_rewards"] = data["rm_scores"]
+        if self.opd_no_task_reward_fast_path:
+            task_scores = data["rm_scores"].sum(dim=-1, keepdim=True)
+            if self.config.algorithm.get("norm_adv_by_std_in_grpo", True):
+                task_scores = task_scores / (1.0 + 1e-6)
+            task_advantages = task_scores * data["response_mask"]
+            data["advantages"] = task_advantages
+            data["returns"] = task_advantages
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})

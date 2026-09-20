@@ -234,7 +234,9 @@ trainer:
     trainer_mode: sync
 
     # Synchronous PPO trainer
-    sync: {}
+    sync:
+      # Distillation-only: skip recomputing old_log_prob / advantage.
+      opd_no_task_reward_fast_path: false
 
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:

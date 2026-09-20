@@ -20,6 +20,7 @@ from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
@@ -204,10 +205,21 @@ def distillation_ppo_loss(
     if student_logits is not None:
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
+    opd_no_task_reward_fast_path = tu.get_non_tensor_data(
+        data=data,
+        key="opd_no_task_reward_fast_path",
+        default=False,
+    )
+    if opd_no_task_reward_fast_path:
+        data["old_log_probs"] = data["rollout_log_probs"]
+
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    if not distillation_loss_config.use_task_rewards and not distillation_loss_config.use_policy_gradient:
+    skip_task_policy_loss = not distillation_loss_config.use_task_rewards and (
+        not distillation_loss_config.use_policy_gradient or opd_no_task_reward_fast_path
+    )
+    if skip_task_policy_loss:
         # no need to compute policy loss
         policy_loss = 0.0
         policy_metrics = {}
