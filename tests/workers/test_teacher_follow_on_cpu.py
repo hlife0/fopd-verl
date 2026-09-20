@@ -21,6 +21,7 @@ from verl.experimental.teacher_loop.teacher_follow import (
     TeacherFollowAccumulator,
     TeacherFollowGapError,
     _should_submit_follow,
+    follow_submit_len,
     _valid_teacher_rows,
 )
 from verl.experimental.teacher_loop.teacher_manager import _get_teacher_sampling_params
@@ -146,13 +147,22 @@ def test_accumulator_partial_cache_overwrites_overlap():
     assert ok, msg
 
 
-def test_should_submit_follow_merges_short_increments():
-    assert _should_submit_follow(10, student_done=False, scored_seq_len=0) is True
+def test_should_submit_follow_aligns_to_kv_block():
+    # Wait until the live prefix fills at least one KV block.
+    assert _should_submit_follow(10, student_done=False, scored_seq_len=0) is False
+    assert _should_submit_follow(16, student_done=False, scored_seq_len=0) is True
+    # scored=20, seq=30 → aligned 16, nothing new.
     assert _should_submit_follow(10, student_done=False, scored_seq_len=20) is False
-    assert _should_submit_follow(127, student_done=False, scored_seq_len=20) is False
-    assert _should_submit_follow(128, student_done=False, scored_seq_len=20) is True
-    assert _should_submit_follow(1, student_done=True, scored_seq_len=20) is True
-    assert _should_submit_follow(0, student_done=True, scored_seq_len=20) is False
+    # scored=20, seq=32 → aligned 32.
+    assert _should_submit_follow(12, student_done=False, scored_seq_len=20) is True
+    # leftover 5 tokens stay until Student finishes.
+    assert _should_submit_follow(5, student_done=False, scored_seq_len=32) is False
+    assert _should_submit_follow(5, student_done=True, scored_seq_len=32) is True
+    assert _should_submit_follow(0, student_done=True, scored_seq_len=32) is False
+    assert follow_submit_len(45, student_done=False, scored_seq_len=0) == 32
+    assert follow_submit_len(48, student_done=False, scored_seq_len=32) == 48
+    assert follow_submit_len(53, student_done=False, scored_seq_len=48) == 0
+    assert follow_submit_len(53, student_done=True, scored_seq_len=48) == 53
 
 
 def test_follow_sampling_params_enable_prefix_read():

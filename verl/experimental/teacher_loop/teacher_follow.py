@@ -30,9 +30,9 @@ from typing import Any, Optional
 
 import torch
 
-# While Student is still decoding, wait until this many new tokens before the
-# next Teacher request so one prefill is not split into many tiny ones.
-FOLLOW_MIN_NEW_TOKENS = 128
+# vLLM prefix cache is stored in token blocks. Mid-follow requests send
+# floor(seq_len / block) * block so each hop ends on a full block.
+FOLLOW_KV_BLOCK_SIZE = 16
 
 # Follow-only fields written onto extra_fields / TransferQueue tags.
 TEACHER_FOLLOW_TRACE_KEYS = (
@@ -129,22 +129,37 @@ def valid_teacher_rows(
 _valid_teacher_rows = valid_teacher_rows
 
 
+def follow_submit_len(
+    seq_len: int,
+    student_done: bool,
+    scored_seq_len: int,
+    block_size: int = FOLLOW_KV_BLOCK_SIZE,
+) -> int:
+    """How many prefix tokens to send. 0 means wait.
+
+    While Student is decoding, drop the tail that does not fill a KV block.
+    After Student finishes, send the remaining full prefix (including that tail).
+    """
+    if seq_len <= scored_seq_len:
+        return 0
+    if student_done:
+        return seq_len
+    aligned = seq_len - (seq_len % block_size)
+    if aligned <= scored_seq_len:
+        return 0
+    return aligned
+
+
 def should_submit_follow(
     new_tokens: int,
     student_done: bool,
     scored_seq_len: int,
-    min_new_tokens: int = FOLLOW_MIN_NEW_TOKENS,
+    block_size: int = FOLLOW_KV_BLOCK_SIZE,
 ) -> bool:
-    """Whether to submit the next Teacher request for this sequence.
-
-    First snapshot and the tail after Student finishes go out immediately.
-    While Student is still decoding, merge short increments.
-    """
+    """Whether to submit the next Teacher request for this sequence."""
     if new_tokens <= 0:
         return False
-    if student_done or scored_seq_len == 0:
-        return True
-    return new_tokens >= min_new_tokens
+    return follow_submit_len(scored_seq_len + new_tokens, student_done, scored_seq_len, block_size) > scored_seq_len
 
 
 _should_submit_follow = should_submit_follow
@@ -308,10 +323,9 @@ class StudentTokenState:
         return list(self.prompt_ids) + list(self.response_ids)
 
     async def wait_until_submittable(self, scored_seq_len: int) -> None:
-        """Wait for more tokens or Student done. Do not busy-loop on a short increment."""
+        """Wait for a new full KV block or Student done."""
         self.event.clear()
-        new_tokens = len(self.snapshot()) - scored_seq_len
-        if should_submit_follow(new_tokens, self.student_done, scored_seq_len):
+        if follow_submit_len(len(self.snapshot()), self.student_done, scored_seq_len) > scored_seq_len:
             return
         if self.student_done:
             return

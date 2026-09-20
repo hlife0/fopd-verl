@@ -29,6 +29,7 @@ from verl.experimental.teacher_loop.teacher_follow import (
     _should_submit_follow,
     _valid_teacher_rows,
     copy_teacher_engine_timings,
+    follow_submit_len,
     should_submit_follow,
     unpack_teacher_extract,
 )
@@ -61,7 +62,7 @@ def _dump_follow_request_log(request_id: str, request_log: list[dict[str, Any]])
         return
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "teacher_requests.jsonl")
-    with open(path, "a") as fh:
+    with open(path, "a", encoding="utf-8") as fh:
         for index, row in enumerate(request_log):
             fh.write(json.dumps({"request_id": request_id, "request_index": index, **row}) + "\n")
 
@@ -309,7 +310,8 @@ class AsyncTeacherLLMServerManager:
         """Follow one Student sequence: at most one in-flight Teacher request.
 
         Idle signal is this sequence's previous Teacher request finishing.
-        Payload is always the full current prefix; compute is only the new suffix.
+        Mid-follow payload is the current prefix floored to a KV block; the last
+        request after Student finishes is the full prefix. Compute is the suffix.
         """
         await state.ready.wait()
         acc = TeacherFollowAccumulator(_teacher_topk_width(self.distillation_loss_config))
@@ -323,38 +325,52 @@ class AsyncTeacherLLMServerManager:
 
         while True:
             seq = state.snapshot()
-            new_tokens = len(seq) - acc.scored_seq_len
-            if should_submit_follow(new_tokens, state.student_done, acc.scored_seq_len):
+            submit_len = follow_submit_len(len(seq), state.student_done, acc.scored_seq_len)
+            if submit_len > acc.scored_seq_len:
                 if teacher_start_ts is None:
                     teacher_start_ts = time.time()
                 scored_before = acc.scored_seq_len
                 submit_ts = time.time()
+                payload = seq[:submit_len]
                 extra = await self._teacher_forward(
-                    seq,
+                    payload,
                     request_id=request_id,
                     follow=True,
                     multi_modal_data=state.multi_modal_data,
                     mm_processor_kwargs=state.mm_processor_kwargs,
                     routing_key=routing_key,
                 )
-                extra_calls = await self._apply_follow_extract(acc, seq, extra, request_id, routing_key, state)
+                extra_calls = await self._apply_follow_extract(acc, payload, extra, request_id, routing_key, state)
                 num_requests += 1 + extra_calls
                 last_cached = int(extra.get("num_cached_tokens") or 0)
                 last_prefill_s = extra.get("engine_prefill_s")
+                row = {
+                    "seq_len": len(seq),
+                    "payload_len": int(submit_len),
+                    "new_tokens": int(submit_len - scored_before),
+                    "scored_before": int(scored_before),
+                    "num_cached": last_cached,
+                    "prefill_s": last_prefill_s,
+                    "submit_ts": submit_ts,
+                    "student_done": bool(state.student_done),
+                    "hole_fills": int(extra_calls),
+                }
+                request_log.append(row)
+                _follow_cache_log = os.environ.get("FOPD_FOLLOW_CACHE_LOG")
+                if _follow_cache_log:
+                    with open(_follow_cache_log, "a", encoding="utf-8") as _fh:
+                        _fh.write(
+                            json.dumps(
+                                {
+                                    "request_id": request_id,
+                                    "n": num_requests,
+                                    **row,
+                                }
+                            )
+                            + "\n"
+                        )
                 if first_prefill_s is None:
                     first_prefill_s = last_prefill_s
-                request_log.append(
-                    {
-                        "seq_len": len(seq),
-                        "new_tokens": int(new_tokens),
-                        "scored_before": int(scored_before),
-                        "num_cached": last_cached,
-                        "prefill_s": last_prefill_s,
-                        "submit_ts": submit_ts,
-                        "student_done": bool(state.student_done),
-                        "hole_fills": int(extra_calls),
-                    }
-                )
                 extra_out = extra
                 copy_teacher_engine_timings(extra_out, extra)
             elif state.student_done:

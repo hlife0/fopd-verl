@@ -1394,10 +1394,6 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
-            # Teacher follow: batch-invariant attention so growing prefixes
-            # stay closer to a one-shot of the finished sequence.
-            if getattr(self, "teacher_follow", False):
-                env_vars["VLLM_BATCH_INVARIANT"] = "1"
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
