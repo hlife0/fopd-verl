@@ -68,3 +68,19 @@ def test_mtp_hybrid_sleep_keeps_drafter_available_for_nonzero_acceptance(monkeyp
 
     assert metrics["rollout/spec_accept_rate"] > 0.0
     assert metrics["rollout/spec_accept_length"] > 1.0
+
+
+def test_eagle_engine_kwargs_hybrid_sleep_keeps_drafter(monkeypatch):
+    monkeypatch.setattr(vllm_async_server, "is_torch_npu_available", lambda check_device=False: False)
+
+    engine = _FakeMtpEngine()
+    engine.vllm_config = SimpleNamespace(speculative_config={"method": "eagle3"})
+
+    server = object.__new__(vllm_async_server.vLLMHttpServer)
+    server.config = SimpleNamespace(mtp=SimpleNamespace(enable=False, enable_rollout=False))
+    server.model_config = SimpleNamespace(lora_rank=0, lora={})
+    server.engine = engine
+
+    assert server._resolve_sleep_level() == 1
+    asyncio.run(server._sleep_hybrid())
+    assert engine.mtp_drafter_available

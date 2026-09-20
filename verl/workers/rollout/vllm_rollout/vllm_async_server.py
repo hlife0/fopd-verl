@@ -1310,23 +1310,24 @@ class vLLMHttpServer:
     def _resolve_sleep_level(self) -> int:
         """Deepest sleep level whose discarded state a subsequent weight sync can restore.
 
-        MTP drafter-only weights are initialized by vLLM and are not guaranteed
-        to be restored by actor weight sync after level 2 sleep discards them.
-        lora only update adapter weights, so set sleep level to 1.
+        MTP and EAGLE drafter-only weights are initialized by vLLM and are not
+        guaranteed to be restored by actor weight sync after level 2 sleep
+        discards them. lora only update adapter weights, so set sleep level to 1.
         vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
         """
+        spec = getattr(getattr(getattr(self, "engine", None), "vllm_config", None), "speculative_config", None)
         mtp_config = getattr(self.config, "mtp", None)
         mtp_rollout_enabled = (
             mtp_config is not None
             and getattr(mtp_config, "enable", False)
             and getattr(mtp_config, "enable_rollout", False)
         )
-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        if spec is not None or mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
             return 1
         return 2
 
     async def _sleep_hybrid(self):
-        """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
+        """HYBRID sleep: adapters and drafters need level=1; full weights need level=2.
 
         Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
         that sleep is properly propagated to all data-parallel worker processes.
