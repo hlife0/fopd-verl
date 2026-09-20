@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import gc
 import logging
 import os
 from contextlib import nullcontext
@@ -765,7 +766,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return metrics or {}
 
         set_expandable_segments(False)
-        aggressive_empty_cache(force_sync=True)
+        freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
+        publication_opt = bool(freeze_step)
+        if publication_opt and global_steps == int(freeze_step):
+            # Warm-up boundary: later cleanup scans only objects allocated after this.
+            gc.collect()
+            gc.freeze()
+            logger.warning("OPD publication GC frozen at global step %s", global_steps)
+        aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
@@ -809,7 +817,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
+        if not publication_opt:
+            aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
