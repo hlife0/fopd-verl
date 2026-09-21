@@ -155,6 +155,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self._held_train_ctx = None
+        self._held_output_lst = []
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -337,6 +339,105 @@ class TrainingWorker(Worker, DistProfilerExtension):
             else:
                 output = None
         return output
+
+    def begin_held_train(self):
+        if self._held_train_ctx is not None:
+            raise RuntimeError("held train is already open")
+        self._held_output_lst = []
+        self._held_train_ctx = self.engine.train_mode()
+        self._held_train_ctx.__enter__()
+        self.engine.optimizer_zero_grad()
+
+    def _inject_train_defaults(self, data: TensorDict) -> None:
+        default_keys = dict(
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
+            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
+            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
+            use_fused_kernels=self.engine_config.use_fused_kernels,
+        )
+        for key, val in default_keys.items():
+            if key not in data.keys():
+                tu.assign_non_tensor(data, **{key: val})
+
+    def _global_token_num(self, data: TensorDict):
+        if "input_ids" not in data:
+            return None
+        global_token_num = data["input_ids"].offsets().diff().tolist()
+        global_token_num_output = [None] * torch.distributed.get_world_size(self.engine.get_data_parallel_group())
+        torch.distributed.all_gather_object(
+            global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+        )
+        return [x for xs in global_token_num_output for x in xs]
+
+    def _close_held_train(self, *, step: bool):
+        ctx = self._held_train_ctx
+        try:
+            grad_norm = None
+            lr = None
+            if step:
+                grad_norm = self.engine.optimizer_step()
+                lr = self.engine.lr_scheduler_step()
+            if self.engine.is_mp_src_rank_with_outputs():
+                actor_output = [tu.get(output, "metrics") for output in self._held_output_lst]
+                metrics = {}
+                for output in actor_output:
+                    for key, val in output.items():
+                        if isinstance(val, list):
+                            output[key] = (
+                                Metric.aggregate_dp(val)
+                                if val and isinstance(val[0], Metric)
+                                else list(chain.from_iterable(val))
+                            )
+                    append_to_dict(metrics, output)
+                if grad_norm is not None:
+                    metrics["grad_norm"] = grad_norm
+                if lr is not None:
+                    metrics["lr"] = lr
+                return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
+            return None
+        finally:
+            if ctx is not None:
+                exc = None if step else (RuntimeError, RuntimeError("abort held train"), None)
+                if exc is None:
+                    ctx.__exit__(None, None, None)
+                else:
+                    ctx.__exit__(*exc)
+            self._held_train_ctx = None
+            self._held_output_lst = []
+
+    def accumulate_held_train(self, data: TensorDict) -> TensorDict:
+        if self._held_train_ctx is None:
+            raise RuntimeError("held train is not open")
+        maybe_fix_3d_position_ids(data)
+        self._inject_train_defaults(data)
+        global_token_num = self._global_token_num(data)
+        with Timer(name="train_batch", logger=None) as timer:
+            output = self.engine.forward_backward_batch(data, loss_function=self.loss_fn, forward_only=False)
+        if self.engine.is_mp_src_rank_with_outputs():
+            output.pop("model_output", None)
+            processed = self._postprocess_output(
+                output,
+                global_token_num=global_token_num,
+                delta_time=timer.last,
+                forward_only=False,
+                images_seqlens=tu.get(data, key="images_seqlens", default=None),
+            ).cpu()
+            self._held_output_lst.append(processed)
+        else:
+            processed = None
+        self.profiler.step()
+        return processed
+
+    def finish_held_train(self):
+        if self._held_train_ctx is None:
+            raise RuntimeError("held train is not open")
+        return self._close_held_train(step=True)
+
+    def abort_held_train(self):
+        if self._held_train_ctx is None:
+            return
+        self._close_held_train(step=False)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")
@@ -713,6 +814,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def begin_actor_accumulate(self):
+        self.actor.begin_held_train()
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
+    @_with_routing_replay_flag(enabled=True)
+    def accumulate_actor(self, data: TensorDict) -> TensorDict:
+        output = self.actor.accumulate_held_train(data)
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def finish_actor_accumulate(self):
+        return self.actor.finish_held_train()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def abort_actor_accumulate(self):
+        self.actor.abort_held_train()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

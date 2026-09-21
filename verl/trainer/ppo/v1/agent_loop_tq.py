@@ -205,7 +205,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             extra = output.extra_fields if isinstance(output.extra_fields, dict) else {}
             extra["student_gen_done_ts"] = time.time()
             output.extra_fields = extra
+            # Publish Student fields before the leftover Teacher hops so Actor can
+            # start old_log_prob after the student barrier. Teacher fields merge later.
             state.mark_done()
+            await self._publish_agent_outputs([output], False, **kwargs)
             teacher_ids, teacher_logprobs, teacher_extra = await follow_task
             extra["teacher_ids"] = teacher_ids
             extra["teacher_logprobs"] = teacher_logprobs
@@ -218,16 +221,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         finally:
             self._student_token_states.pop(key, None)
 
-    async def _agent_loop_postprocess(
-        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
-    ) -> None:
-        """Put agent loop outputs into TransferQueue."""
-        uid, session_id = kwargs["uid"], kwargs["session_id"]
-        outputs = output if isinstance(output, list) else [output]
-        if not outputs:
-            logger.warning(f"Empty output for prompt {uid}_{session_id}")
-            return
+    async def _publish_agent_outputs(self, outputs: list[AgentLoopOutput], validate, **kwargs) -> None:
+        """Write one session's trajectories to TransferQueue.
 
+        Safe to call twice: Student-only first, then again after Teacher fields land.
+        TransferQueue merges per-field, so a later put must not rewrite the whole
+        value (old_log_probs written by A-lite stay).
+        """
+        uid, session_id = kwargs["uid"], kwargs["session_id"]
         last = outputs[-1]
         extra = last.extra_fields if isinstance(last.extra_fields, dict) else {}
         student_submit_ts = extra.get("student_submit_ts")
@@ -246,37 +247,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         student_gen_start_ts = (
             float(student_submit_ts) if student_submit_ts is not None else student_gen_done_ts - gen_dur
         )
-
-        await self._compute_score(outputs, kwargs=kwargs)
-
-        final_output = last
-        extra = last.extra_fields if isinstance(last.extra_fields, dict) else extra
-        if extra.get("teacher_ids") is None:
-            teacher_start_ts = time.time()
-            # TODO: Support output:list[AgentLoopOutput]
-            await self._compute_teacher_logprobs(
-                final_output,
-                prompt_ids=final_output.prompt_ids,
-                response_ids=final_output.response_ids,
-                validate=validate,
-                sample_kwargs=kwargs,
-            )
+        teacher_start_ts = extra.get("teacher_start_ts") or extra.get("teacher_submit_ts")
+        teacher_done_ts = extra.get("teacher_done_ts")
+        if extra.get("teacher_ids") is not None and teacher_done_ts is None:
             teacher_done_ts = time.time()
-            extra = last.extra_fields if isinstance(last.extra_fields, dict) else extra
-        else:
-            teacher_start_ts = extra.get("teacher_start_ts") or extra.get("teacher_submit_ts")
-            teacher_done_ts = extra.get("teacher_done_ts") or time.time()
 
-        if final_output.reward_score is not None:
-            for output in outputs[:-1]:
-                output.reward_score = final_output.reward_score
-                output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
-
-        # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
-        # key format: {uid}_{session_id}_{index}
-        # - uid: raw prompt uid from dataset
-        # - session_id: session id for rollout.n sampling
-        # - index: index of agent loop output
         keys, fields, tags = [], [], []
         for i, output in enumerate(outputs):
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
@@ -300,39 +275,43 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["multi_modal_inputs"] = multi_modal_inputs
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
-            tags.append(
-                {
-                    "status": "success",
-                    "prompt_len": prompt_len,
-                    "response_len": response_len,
-                    "seq_len": prompt_len + response_len,
-                    # These tags are used for off-policy staleness control, if a trajectory
-                    # spans too many global steps, we need to filter it out.
-                    # global_steps: which global steps this sample is from dataloader
-                    "global_steps": kwargs["global_steps"],
-                    # min_global_steps: start generation model weights version of this trajectory
-                    "min_global_steps": field["extra_fields"].get("min_global_steps"),
-                    # max_global_steps: end generation model weights version of this trajectory
-                    "max_global_steps": field["extra_fields"].get("max_global_steps"),
-                    "student_gen_start_ts": student_gen_start_ts,
-                    "student_gen_done_ts": student_gen_done_ts,
-                    "student_submit_ts": student_submit_ts,
-                    "student_first_token_ts": student_first_token_ts,
-                    "student_last_token_ts": student_last_token_ts,
-                    "engine_queue_s": engine_queue_s,
-                    "engine_prefill_s": engine_prefill_s,
-                    "engine_decode_s": engine_decode_s,
-                    "teacher_start_ts": teacher_start_ts,
-                    "teacher_done_ts": teacher_done_ts,
-                    "teacher_submit_ts": extra.get("teacher_submit_ts"),
-                    "teacher_first_token_ts": extra.get("teacher_first_token_ts"),
-                    "teacher_last_token_ts": extra.get("teacher_last_token_ts"),
-                    "teacher_engine_queue_s": extra.get("teacher_engine_queue_s"),
-                    "teacher_engine_prefill_s": extra.get("teacher_engine_prefill_s"),
-                    "teacher_engine_decode_s": extra.get("teacher_engine_decode_s"),
-                    **{key: extra.get(key) for key in TEACHER_FOLLOW_TRACE_KEYS},
-                }
-            )
+            tag = {
+                "status": "success",
+                "prompt_len": prompt_len,
+                "response_len": response_len,
+                "seq_len": prompt_len + response_len,
+                # These tags are used for off-policy staleness control, if a trajectory
+                # spans too many global steps, we need to filter it out.
+                # global_steps: which global steps this sample is from dataloader
+                "global_steps": kwargs["global_steps"],
+                # min_global_steps: start generation model weights version of this trajectory
+                "min_global_steps": field["extra_fields"].get("min_global_steps"),
+                # max_global_steps: end generation model weights version of this trajectory
+                "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                "student_gen_start_ts": student_gen_start_ts,
+                "student_gen_done_ts": student_gen_done_ts,
+            }
+            optional_tag = {
+                "student_submit_ts": student_submit_ts,
+                "student_first_token_ts": student_first_token_ts,
+                "student_last_token_ts": student_last_token_ts,
+                "engine_queue_s": engine_queue_s,
+                "engine_prefill_s": engine_prefill_s,
+                "engine_decode_s": engine_decode_s,
+                "teacher_start_ts": teacher_start_ts,
+                "teacher_done_ts": teacher_done_ts,
+                "teacher_submit_ts": extra.get("teacher_submit_ts"),
+                "teacher_first_token_ts": extra.get("teacher_first_token_ts"),
+                "teacher_last_token_ts": extra.get("teacher_last_token_ts"),
+                "teacher_engine_queue_s": extra.get("teacher_engine_queue_s"),
+                "teacher_engine_prefill_s": extra.get("teacher_engine_prefill_s"),
+                "teacher_engine_decode_s": extra.get("teacher_engine_decode_s"),
+                **{key: extra.get(key) for key in TEACHER_FOLLOW_TRACE_KEYS},
+            }
+            for key, value in optional_tag.items():
+                if value is not None:
+                    tag[key] = value
+            tags.append(tag)
 
         await tq.async_kv_batch_put(
             keys=keys,
@@ -340,6 +319,51 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tags=tags,
             partition_id="train" if not validate else "val",
         )
+
+    async def _agent_loop_postprocess(
+        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+    ) -> None:
+        """Put agent loop outputs into TransferQueue."""
+        uid, session_id = kwargs["uid"], kwargs["session_id"]
+        outputs = output if isinstance(output, list) else [output]
+        if not outputs:
+            logger.warning(f"Empty output for prompt {uid}_{session_id}")
+            return
+
+        await self._compute_score(outputs, kwargs=kwargs)
+
+        last = outputs[-1]
+        extra = last.extra_fields if isinstance(last.extra_fields, dict) else {}
+        if extra.get("student_gen_done_ts") is None:
+            extra["student_gen_done_ts"] = time.time()
+            last.extra_fields = extra
+        if extra.get("teacher_ids") is None:
+            # One-shot Teacher: publish Student first so A-lite can start Actor work.
+            if not validate:
+                await self._publish_agent_outputs(outputs, validate, **kwargs)
+            teacher_start_ts = time.time()
+            extra["teacher_start_ts"] = teacher_start_ts
+            # TODO: Support output:list[AgentLoopOutput]
+            await self._compute_teacher_logprobs(
+                last,
+                prompt_ids=last.prompt_ids,
+                response_ids=last.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
+            extra = last.extra_fields if isinstance(last.extra_fields, dict) else extra
+            extra.setdefault("teacher_start_ts", teacher_start_ts)
+            extra["teacher_done_ts"] = extra.get("teacher_done_ts") or time.time()
+            last.extra_fields = extra
+
+        if last.reward_score is not None:
+            for output in outputs[:-1]:
+                output.reward_score = last.reward_score
+                output.extra_fields["reward_extra_info"] = last.extra_fields["reward_extra_info"]
+
+        # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
+        # key format: {uid}_{session_id}_{index}
+        await self._publish_agent_outputs(outputs, validate, **kwargs)
 
 
 class AgentLoopManagerTQ(AgentLoopManager):

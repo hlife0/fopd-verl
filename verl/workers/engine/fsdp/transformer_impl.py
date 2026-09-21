@@ -722,11 +722,19 @@ class FSDPEngine(BaseEngine):
         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
 
         # compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
-        torch.distributed.all_reduce(
-            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
-        )
-        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        batch_num_tokens_override = tu.get(data, key="batch_num_tokens_override", default=None)
+        if batch_num_tokens_override is None:
+            batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            batch_num_tokens = batch_num_tokens.item()
+        else:
+            if isinstance(batch_num_tokens_override, torch.Tensor):
+                batch_num_tokens_override = batch_num_tokens_override.item()
+            # Already the global token count for the full optimizer batch.
+            batch_num_tokens = float(batch_num_tokens_override)
+        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(

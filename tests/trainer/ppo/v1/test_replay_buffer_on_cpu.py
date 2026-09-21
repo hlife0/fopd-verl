@@ -1286,3 +1286,141 @@ def test_wait_for_sampleable_replaces_groups_sample_would_have_evicted(tq_init, 
         assert _uids_of(batch.keys) == {refiller.produced_uids[0]}
     finally:
         _clear_partition(partition_id)
+
+
+def _put_student_ready_group(partition_id: str, uid: str, *, sessions: int = 1, status: str = "running") -> list[str]:
+    keys = []
+    for session_id in range(sessions):
+        key = _trajectory_key(uid, session_id)
+        tq.kv_put(
+            key=key,
+            partition_id=partition_id,
+            fields={"input_ids": torch.tensor([1, 2, 3])},
+            tag={
+                "is_prompt": False,
+                "seq_len": 3,
+                "global_steps": 0,
+                "student_gen_done_ts": 1.0,
+            },
+        )
+        keys.append(key)
+    tq.kv_put(
+        key=uid,
+        partition_id=partition_id,
+        tag={"is_prompt": True, "status": status, "global_steps": 0},
+    )
+    return keys
+
+
+def test_wait_until_students_done_blocks_until_student_tag(tq_init, partition_id):
+    uid = _uid()
+    tq.kv_put(
+        key=uid,
+        partition_id=partition_id,
+        tag={"is_prompt": True, "status": "running", "global_steps": 0},
+    )
+    rb = _make_rb()
+    ready: list[set[str]] = []
+
+    def waiter():
+        ready.append(rb.wait_until_students_done(partition_id, batch_size=1))
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    try:
+        thread.start()
+        time.sleep(POLL_INTERVAL * 5)
+        assert thread.is_alive(), "wait must block until student_gen_done_ts is published"
+        tq.kv_put(
+            key=_trajectory_key(uid),
+            partition_id=partition_id,
+            fields={"input_ids": torch.tensor([1, 2, 3])},
+            tag={
+                "is_prompt": False,
+                "seq_len": 3,
+                "global_steps": 0,
+                "student_gen_done_ts": 1.0,
+            },
+        )
+        thread.join(timeout=10.0)
+        assert not thread.is_alive()
+        assert ready and ready[0] == {uid}
+    finally:
+        thread.join(timeout=10.0)
+        _clear_partition(partition_id)
+
+
+def test_peek_student_ready_does_not_clear_prompt_keys(tq_init, partition_id):
+    uid = _uid()
+    traj_keys = _put_student_ready_group(partition_id, uid)
+    rb = _make_rb()
+    try:
+        rb.wait_until_students_done(partition_id, batch_size=1)
+        batch = rb.peek_student_ready(partition_id, batch_size=1)
+        assert set(batch.keys) == set(traj_keys)
+        listed = tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        assert uid in listed
+        _set_prompt_status(partition_id, uid, "finished", global_steps=0)
+        sampled = _sample(rb, partition_id, batch_size=1)
+        assert set(sampled.keys) == set(traj_keys)
+        listed = tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        assert uid not in listed
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_peek_teacher_ready_keys_and_trajectories(tq_init, partition_id):
+    uid = _uid()
+    traj_keys = _put_student_ready_group(partition_id, uid)
+    rb = _make_rb()
+    try:
+        rb.wait_until_students_done(partition_id, batch_size=1)
+        assert rb.peek_teacher_ready_keys(partition_id, traj_keys) == []
+        tq.kv_put(
+            key=traj_keys[0],
+            partition_id=partition_id,
+            fields={"input_ids": torch.tensor([1, 2, 3])},
+            tag={
+                "is_prompt": False,
+                "seq_len": 3,
+                "global_steps": 0,
+                "student_gen_done_ts": 1.0,
+                "teacher_done_ts": 2.0,
+            },
+        )
+        ready = rb.peek_teacher_ready_keys(partition_id, traj_keys)
+        assert ready == traj_keys
+        batch = rb.peek_trajectories(partition_id, ready)
+        assert batch.keys == traj_keys
+        listed = tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        assert uid in listed
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_student_ready_requires_all_sessions(tq_init, partition_id):
+    uid = _uid()
+    tq.kv_put(
+        key=_trajectory_key(uid, 0),
+        partition_id=partition_id,
+        fields={"input_ids": torch.tensor([1, 2, 3])},
+        tag={"is_prompt": False, "seq_len": 3, "global_steps": 0, "student_gen_done_ts": 1.0},
+    )
+    tq.kv_put(
+        key=uid,
+        partition_id=partition_id,
+        tag={"is_prompt": True, "status": "running", "global_steps": 0},
+    )
+    rb = _make_rb()
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        assert rb._student_ready_prompt_uids(partition_id, sessions_per_prompt=2) == set()
+        tq.kv_put(
+            key=_trajectory_key(uid, 1),
+            partition_id=partition_id,
+            fields={"input_ids": torch.tensor([1, 2, 3])},
+            tag={"is_prompt": False, "seq_len": 3, "global_steps": 0, "student_gen_done_ts": 2.0},
+        )
+        rb._sync_metadata_from_transfer_queue()
+        assert rb._student_ready_prompt_uids(partition_id, sessions_per_prompt=2) == {uid}
+    finally:
+        _clear_partition(partition_id)

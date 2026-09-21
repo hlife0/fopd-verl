@@ -238,6 +238,11 @@ trainer:
       # Distillation-only: skip recomputing old_log_prob / advantage.
       opd_no_task_reward_fast_path: false
 
+      # After every Student finishes, sleep Student vLLM. With the OPD fast path,
+      # stream Actor F/B on teacher-ready samples while leftover Teacher scores.
+      # Without the fast path, leftover Teacher overlaps old_log_prob instead.
+      early_actor_lite: false
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

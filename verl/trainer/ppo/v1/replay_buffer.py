@@ -380,11 +380,9 @@ class ReplayBuffer:
         )
         return ordered_keys[:batch_size], partition_snapshot, prompt_global_steps_snapshot
 
-    def _materialize_batch(
+    def _collect_trajectory_batch(
         self, partition_id: str, selected_prompt_uids: list[str], partition_snapshot: dict[str, dict]
     ) -> KVBatchMeta:
-        tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
-
         keys, tags = [], []
         selected = set(selected_prompt_uids)
         for key, tag in partition_snapshot.items():
@@ -392,6 +390,94 @@ class ReplayBuffer:
             if uid in selected:
                 keys.append(key)
                 tags.append(tag)
+        return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+
+    def _materialize_batch(
+        self, partition_id: str, selected_prompt_uids: list[str], partition_snapshot: dict[str, dict]
+    ) -> KVBatchMeta:
+        tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
+        return self._collect_trajectory_batch(partition_id, selected_prompt_uids, partition_snapshot)
+
+    def _student_ready_prompt_uids(self, partition_id: str, sessions_per_prompt: int) -> set[str]:
+        """Prompts whose published sessions already have ``student_gen_done_ts``.
+
+        Prompt status may still be ``running`` because Teacher / postprocess has
+        not finished. Do not require ``finished``.
+        """
+        if sessions_per_prompt <= 0:
+            raise ValueError(f"sessions_per_prompt must be positive, got {sessions_per_prompt}")
+        candidates = (
+            self.running_keys[partition_id] | self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        )
+        ready = set()
+        for uid in candidates:
+            done = 0
+            for key, tag in self.partitions[partition_id].items():
+                if key.split("_")[0] != uid:
+                    continue
+                if tag.get("student_gen_done_ts") is not None:
+                    done += 1
+            if done >= sessions_per_prompt:
+                ready.add(uid)
+        return ready
+
+    def wait_until_students_done(
+        self,
+        partition_id: str,
+        batch_size: int,
+        sessions_per_prompt: int = 1,
+    ) -> set[str]:
+        """Block until ``batch_size`` prompts have published Student-complete trajectories."""
+        last_debug_time = time.time()
+        while True:
+            self._sync_metadata_from_transfer_queue()
+            ready = self._student_ready_prompt_uids(partition_id, sessions_per_prompt)
+            if len(ready) >= batch_size:
+                return ready
+            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+
+    def peek_student_ready(
+        self,
+        partition_id: str,
+        batch_size: int,
+        sessions_per_prompt: int = 1,
+    ) -> KVBatchMeta:
+        """Return Student-ready trajectories without clearing prompt keys.
+
+        Teacher may still be writing those keys. ``sample()`` later materializes
+        the finished groups and clears the prompt entries.
+        """
+        self._sync_metadata_from_transfer_queue()
+        ready = self._student_ready_prompt_uids(partition_id, sessions_per_prompt)
+        if len(ready) < batch_size:
+            raise RuntimeError(
+                f"peek_student_ready expected {batch_size} Student-ready prompts, found {len(ready)}"
+            )
+        selected_prompt_uids, partition_snapshot, _prompt_global_steps_snapshot = self._select_prompt_uids(
+            partition_id, ready, batch_size
+        )
+        return self._collect_trajectory_batch(partition_id, selected_prompt_uids, partition_snapshot)
+
+    def peek_teacher_ready_keys(self, partition_id: str, traj_keys: list[str]) -> list[str]:
+        """Return trajectory keys that already have ``teacher_done_ts``, without clearing."""
+        self._sync_metadata_from_transfer_queue()
+        ready = []
+        for key in traj_keys:
+            tag = self.partitions[partition_id].get(key)
+            if tag is not None and tag.get("teacher_done_ts") is not None:
+                ready.append(key)
+        return ready
+
+    def peek_trajectories(self, partition_id: str, traj_keys: list[str]) -> KVBatchMeta:
+        """Materialize selected trajectories without clearing prompt keys."""
+        self._sync_metadata_from_transfer_queue()
+        keys, tags = [], []
+        for key in traj_keys:
+            tag = self.partitions[partition_id].get(key)
+            if tag is None:
+                raise RuntimeError(f"peek_trajectories missing key {key} in partition {partition_id}")
+            keys.append(key)
+            tags.append(tag)
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:

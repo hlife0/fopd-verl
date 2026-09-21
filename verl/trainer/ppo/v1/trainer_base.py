@@ -152,6 +152,7 @@ class PPOTrainer(ABC):
         # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
         self.local_trigger_step = 0
         self._restored_tq_prompt_count = 0
+        self._trace_step_start_ts = None
         self._trace_actor_start_ts = None
         self._trace_actor_done_ts = None
         self._trace_weights_start_ts = None
@@ -525,6 +526,7 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        self._trace_step_start_ts = time.time()
         train_batch_size = self.config.data.train_batch_size
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
@@ -620,7 +622,7 @@ class PPOTrainer(ABC):
         for tag in batch.tags:
             if tag.get("is_padding", False):
                 continue
-            if "student_gen_done_ts" not in tag or "teacher_done_ts" not in tag:
+            if tag.get("student_gen_done_ts") is None or tag.get("teacher_done_ts") is None:
                 continue
             student_done = float(tag["student_gen_done_ts"])
             student_dones.append(student_done)
@@ -667,6 +669,15 @@ class PPOTrainer(ABC):
                     "weights_done_ts": self._trace_weights_done_ts,
                 }
             )
+        actor_start = self._trace_actor_start_ts
+        teacher_dones = [
+            float(sample["teacher_done_ts"]) for sample in samples if sample.get("teacher_done_ts") is not None
+        ]
+        teachers_after_actor_start = 0
+        actor_teacher_overlap_s = 0.0
+        if actor_start is not None and teacher_dones:
+            teachers_after_actor_start = sum(1 for done in teacher_dones if done > actor_start)
+            actor_teacher_overlap_s = max(0.0, max(teacher_dones) - actor_start)
         path = os.path.join(out_dir, f"step_{self.global_steps}_samples.json")
         with open(path, "w") as fh:
             json.dump(
@@ -678,6 +689,8 @@ class PPOTrainer(ABC):
                     "actor_done_ts": self._trace_actor_done_ts,
                     "weights_start_ts": self._trace_weights_start_ts,
                     "weights_done_ts": self._trace_weights_done_ts,
+                    "teachers_after_actor_start": teachers_after_actor_start,
+                    "actor_teacher_overlap_s": actor_teacher_overlap_s,
                     "samples": samples,
                 },
                 fh,
@@ -1633,19 +1646,28 @@ class PPOTrainer(ABC):
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
-    def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens."""
-        # get actor dp size
+    def _actor_dp_size(self) -> int:
         role, worker_group = "actor", self.actor_rollout_wg
         if role not in worker_group._dispatch_info:
             dp_rank_mapping = worker_group._query_dispatch_info(role)
             worker_group._dispatch_info[role] = dp_rank_mapping
         else:
             dp_rank_mapping = worker_group._dispatch_info[role]
-        dp_size = max(dp_rank_mapping) + 1
+        return max(dp_rank_mapping) + 1
+
+    def _balance_batch(
+        self,
+        batch: KVBatchMeta,
+        metrics,
+        logging_prefix="global_seqlen",
+        keep_minibatch=False,
+        align_to_mini_batch=True,
+    ):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens."""
+        dp_size = self._actor_dp_size()
 
         # Upsampling the batch with padding sequences
-        batch_multiple = self._get_required_batch_multiple(dp_size)
+        batch_multiple = self._get_required_batch_multiple(dp_size) if align_to_mini_batch else dp_size
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
@@ -1852,8 +1874,7 @@ class PPOTrainer(ABC):
 
         return batch
 
-    def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Update the actor network."""
+    def _actor_update_extra_info(self) -> dict:
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
@@ -1872,7 +1893,7 @@ class PPOTrainer(ABC):
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
-        extra_info = {
+        return {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
             "distillation_only": distillation_only,
@@ -1884,14 +1905,18 @@ class PPOTrainer(ABC):
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
             "opd_no_task_reward_fast_path": self.opd_no_task_reward_fast_path,
         }
-        batch.extra_info.update(extra_info)
 
-        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+    def _apply_actor_update_metrics(self, output: TensorDict, metrics: dict) -> None:
         output = rename_dict(output["metrics"], "actor/")
-        output["perf/mfu/actor"] = output.pop("actor/mfu")
-        actor_metrics = reduce_metrics(output)
-        metrics.update(actor_metrics)
+        if "actor/mfu" in output:
+            output["perf/mfu/actor"] = output.pop("actor/mfu")
+        metrics.update(reduce_metrics(output))
 
+    def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Update the actor network."""
+        batch.extra_info.update(self._actor_update_extra_info())
+        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+        self._apply_actor_update_metrics(output, metrics)
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
