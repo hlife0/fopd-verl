@@ -115,6 +115,12 @@ def construct_minimal_padding_template(
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
+    # Teacher outputs are aligned to prompt + response, including for K1
+    # distillation (top-k=1). Keeping the source length corrupts packed offsets.
+    for field in ("teacher_ids", "teacher_logprobs"):
+        value = template_sample.get(field)
+        if isinstance(value, torch.Tensor):
+            template_sample[field] = value.new_zeros((SYNTHETIC_PADDING_SEQ_LEN, *value.shape[1:]))
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

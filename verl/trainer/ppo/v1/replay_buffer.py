@@ -468,6 +468,77 @@ class ReplayBuffer:
                 ready.append(key)
         return ready
 
+    def peek_actor_overlap_batch(
+        self, partition_id: str, prompt_uids: list[str], global_steps: int
+    ) -> tuple[KVBatchMeta, list[str]]:
+        """Read only the submitted logical batch, without consuming any groups.
+
+        Route 1 supports one complete trajectory per prompt. Student completion
+        is visible before the group terminates; training eligibility additionally
+        requires successful termination, so a late postprocess failure cannot
+        silently drop part of the batch after its gradients were accumulated.
+        """
+        if not prompt_uids or len(set(prompt_uids)) != len(prompt_uids):
+            raise ValueError("actor_rollout_overlap requires a nonempty, unique prompt set")
+        self._sync_metadata_from_transfer_queue()
+        selected = set(prompt_uids)
+        missing = selected - self.prompt_global_steps[partition_id].keys()
+        failed = selected & self.failure_keys[partition_id]
+        if missing or failed:
+            raise RuntimeError(
+                f"actor_rollout_overlap lost or failed prompt groups: missing={sorted(missing)}, failed={sorted(failed)}"
+            )
+        if any(self.prompt_global_steps[partition_id][uid] != global_steps for uid in prompt_uids):
+            raise RuntimeError("actor_rollout_overlap prompt belongs to a different training step")
+
+        by_uid: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+        for key, tag in self.partitions[partition_id].items():
+            uid = key.split("_")[0]
+            if uid in selected:
+                by_uid[uid].append((key, tag))
+        keys, tags, teacher_ready = [], [], []
+        for uid in prompt_uids:
+            entries = by_uid[uid]
+            finished = uid in self.finished_keys[partition_id]
+            if len(entries) > 1 or (finished and len(entries) != 1):
+                raise RuntimeError("actor_rollout_overlap requires exactly one trajectory per finished prompt")
+            if not entries:
+                continue
+            key, tag = entries[0]
+            # async_kv_batch_put reserves its key before writing the tensors and
+            # publishing tags. kv_list exposes that reservation as an empty dict.
+            # A prompt cannot become terminal until its awaited write completes.
+            if not tag and not finished:
+                continue
+            if tag.get("global_steps") != global_steps or tag.get("is_padding", False):
+                raise RuntimeError(
+                    "actor_rollout_overlap received an invalid or wrong-step trajectory: "
+                    f"expected_step={global_steps}, trajectory_step={tag.get('global_steps')!r}, "
+                    f"prompt_finished={finished}, is_padding={tag.get('is_padding', False)}, "
+                    f"student_done={tag.get('student_gen_done_ts') is not None}, "
+                    f"teacher_done={tag.get('teacher_done_ts') is not None}"
+                )
+            student_done = tag.get("student_gen_done_ts") is not None
+            teacher_done = tag.get("teacher_done_ts") is not None
+            if finished and not (student_done and teacher_done):
+                raise RuntimeError("actor_rollout_overlap finished prompt is missing Student or Teacher output")
+            if student_done:
+                keys.append(key)
+                tags.append(tag)
+            if finished:
+                teacher_ready.append(key)
+        return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags), teacher_ready
+
+    def materialize_actor_overlap_batch(
+        self, partition_id: str, prompt_uids: list[str], global_steps: int
+    ) -> KVBatchMeta:
+        """Consume exactly the finished groups that contributed to this update."""
+        batch, ready = self.peek_actor_overlap_batch(partition_id, prompt_uids, global_steps)
+        if len(ready) != len(prompt_uids):
+            raise RuntimeError("actor_rollout_overlap cannot finalize before every Teacher finishes")
+        tq.kv_clear(partition_id=partition_id, keys=prompt_uids)
+        return batch
+
     def peek_trajectories(self, partition_id: str, traj_keys: list[str]) -> KVBatchMeta:
         """Materialize selected trajectories without clearing prompt keys."""
         self._sync_metadata_from_transfer_queue()

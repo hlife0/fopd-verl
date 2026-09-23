@@ -243,6 +243,14 @@ trainer:
       # Without the fast path, leftover Teacher overlaps old_log_prob instead.
       early_actor_lite: false
 
+      # Route 1: train scored full trajectories while colocated Student vLLM is awake.
+      # Requires early_actor_lite and the OPD no-task-reward fast path.
+      actor_rollout_overlap: false
+
+      # Maximum real trajectories per Actor chunk; 0 selects one Actor DP group.
+      # Positive values must be divisible by Actor DP size.
+      actor_rollout_overlap_chunk_size: 0
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

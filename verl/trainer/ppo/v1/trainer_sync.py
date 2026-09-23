@@ -16,6 +16,7 @@ import logging
 import os
 import time
 
+import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
@@ -34,12 +35,12 @@ def _first_output(output):
     return output
 
 
-def _chunk_fb_s(output) -> float | None:
+def _chunk_metric(output, name: str) -> float | None:
     output = _first_output(output)
     if output is None:
         return None
     try:
-        value = output["metrics"]["chunk_fb_s"]
+        value = output["metrics"][name]
     except Exception:
         return None
     if isinstance(value, (list, tuple)):
@@ -48,6 +49,10 @@ def _chunk_fb_s(output) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _chunk_fb_s(output) -> float | None:
+    return _chunk_metric(output, "chunk_fb_s")
 
 
 @register_trainer("sync")
@@ -60,6 +65,7 @@ class PPOTrainerSync(PPOTrainer):
     def on_init_end(self):
         self._configure_opd_no_task_reward_fast_path()
         self._configure_early_actor_lite()
+        self._configure_actor_rollout_overlap()
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -77,6 +83,8 @@ class PPOTrainerSync(PPOTrainer):
         if self.early_actor_lite:
             metrics["early_actor_lite/enabled"] = 1
             metrics["early_actor_lite/stream_fb"] = int(getattr(self, "early_actor_stream_fb", False))
+        if getattr(self, "actor_rollout_overlap", False):
+            metrics["actor_rollout_overlap/enabled"] = 1
         return batch
 
     def _configure_opd_no_task_reward_fast_path(self) -> None:
@@ -149,7 +157,41 @@ class PPOTrainerSync(PPOTrainer):
                 "old_log_prob with leftover Teacher scoring"
             )
 
+    def _configure_actor_rollout_overlap(self) -> None:
+        sync_config = self.config.trainer.v1.sync
+        self.actor_rollout_overlap = bool(sync_config.get("actor_rollout_overlap", False))
+        if not self.actor_rollout_overlap:
+            return
+        if not self.early_actor_stream_fb:
+            raise ValueError(
+                "actor_rollout_overlap requires early_actor_lite with the OPD fast path, "
+                "FSDP/FSDP2, ppo_epochs=1 and ppo_mini_batch_size=train_batch_size"
+            )
+        if self.config.actor_rollout_ref.actor.loss_agg_mode != "token-mean":
+            raise ValueError("actor_rollout_overlap requires loss_agg_mode=token-mean")
+        if self.parameter_sync_step != 1:
+            raise ValueError("actor_rollout_overlap requires parameter_sync_step=1")
+        if self.config.trainer.critic_warmup > 0:
+            raise ValueError("actor_rollout_overlap requires critic_warmup=0")
+        if int(self.config.data.max_response_length) <= 0:
+            raise ValueError("actor_rollout_overlap requires a positive max_response_length")
+        if int(sync_config.get("actor_rollout_overlap_chunk_size", 0)) < 0:
+            raise ValueError("actor_rollout_overlap_chunk_size must be nonnegative")
+        logger.info("actor_rollout_overlap: accumulate scored trajectories before the Student barrier")
+
+    def prepare_step(self) -> dict:
+        if not getattr(self, "actor_rollout_overlap", False):
+            return super().prepare_step()
+        batch = self._next_train_batch()
+        # Capture the actual submitted IDs, rather than selecting any ready groups
+        # left in the queue (which can belong to another logical batch).
+        self._actor_overlap_prompt_uids = list(batch["uid"])
+        self._submit_batch_to_rollout(batch)
+        return {}
+
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int):
+        if getattr(self, "actor_rollout_overlap", False):
+            return self._stream_actor_during_rollout(metrics, timing_raw, sample_batch_size)
         if not self.early_actor_lite:
             return super()._step_once(metrics, timing_raw, sample_batch_size)
 
@@ -234,6 +276,125 @@ class PPOTrainerSync(PPOTrainer):
                 batch = self._update_actor(batch, metrics=metrics)
             self._trace_actor_done_ts = time.time()
 
+        return batch
+
+    def _stream_actor_during_rollout(
+        self, metrics: dict, timing_raw: dict, sample_batch_size: int
+    ) -> KVBatchMeta:
+        prompt_uids = self._actor_overlap_prompt_uids
+        if len(prompt_uids) != sample_batch_size:
+            raise RuntimeError("actor_rollout_overlap submitted prompt count differs from the logical batch")
+        dp_size = self._actor_dp_size()
+        chunk_cap = int(self.config.trainer.v1.sync.get("actor_rollout_overlap_chunk_size", 0)) or dp_size
+        if chunk_cap < dp_size or chunk_cap % dp_size:
+            raise ValueError("actor_rollout_overlap_chunk_size must be a positive multiple of Actor DP size")
+        denominator = sample_batch_size * int(self.config.data.max_response_length)
+        consumed: set[str] = set()
+        chunks: list[dict] = []
+        padding_keys: list[str] = []
+        started = finalized = students_asleep = False
+        old_poll = self.replay_buffer.poll_interval
+        self.replay_buffer.poll_interval = min(old_poll, 0.05)
+        gen_start = time.time()
+        self._trace_step_start_ts = getattr(self, "_trace_step_start_ts", None) or gen_start
+        self._trace_actor_start_ts = None
+        self._trace_actor_done_ts = None
+        try:
+            self.on_sample_begin()
+            while len(consumed) < sample_batch_size:
+                students, teacher_ready = self.replay_buffer.peek_actor_overlap_batch(
+                    "train", prompt_uids, self.global_steps
+                )
+                if len(students.keys) == sample_batch_size and not students_asleep:
+                    self._trace_student_barrier_ts = time.time()
+                    self._trace_sleep_start_ts = time.time()
+                    self.on_sample_end()
+                    self._trace_sleep_end_ts = time.time()
+                    timing_raw["gen"] = timing_raw.get("gen", 0.0) + time.time() - gen_start
+                    students_asleep = True
+                ready = [key for key in teacher_ready if key not in consumed]
+                remaining = sample_batch_size - len(consumed)
+                take_n = min(len(ready), chunk_cap)
+                # Only the final chunk may need synthetic zero-loss padding.
+                if len(ready) < remaining:
+                    take_n -= take_n % dp_size
+                if take_n == 0:
+                    time.sleep(self.replay_buffer.poll_interval)
+                    continue
+                take = ready[:take_n]
+                chunk = students.select_keys(take)
+                chunk.extra_info.update(self._actor_update_extra_info())
+                chunk = self._balance_batch(
+                    chunk, metrics=metrics, logging_prefix="early_actor_chunk", align_to_mini_batch=False
+                )
+                padding_keys.extend(
+                    key for key, tag in zip(chunk.keys, chunk.tags, strict=True) if tag.get("is_padding", False)
+                )
+                if not started:
+                    self._trace_actor_start_ts = time.time()
+                    started = True  # Abort also cleans up a partially successful collective begin.
+                    self.actor_rollout_wg.begin_actor_accumulate(loss_normalization_tokens=denominator)
+                    self._trace_fsdp_load_end_ts = time.time()
+                dispatch_ts = time.time()
+                output = self.actor_rollout_wg.accumulate_actor(chunk)
+                return_ts = time.time()
+                consumed.update(take)
+                chunks.append(
+                    {
+                        "n": take_n,
+                        "teacher_ready_when_dispatched": len(ready),
+                        "leftover_when_dispatched": remaining - len(ready),
+                        "is_last": len(consumed) == sample_batch_size,
+                        "dispatch_ts": dispatch_ts,
+                        "return_ts": return_ts,
+                        "chunk_fb_s": _chunk_fb_s(output),
+                        "students_done_when_dispatched": len(students.keys),
+                        "chunk_fb_start_ts": _chunk_metric(output, "chunk_fb_start_ts"),
+                        "chunk_fb_end_ts": _chunk_metric(output, "chunk_fb_end_ts"),
+                    }
+                )
+
+            # Every consumed group is terminal and immutable. Validate and consume
+            # this exact set before the only optimizer update, never generic sample().
+            batch = self.replay_buffer.materialize_actor_overlap_batch("train", prompt_uids, self.global_steps)
+            if not students_asleep:
+                raise RuntimeError("actor_rollout_overlap completed training before the Student barrier")
+            self._trace_actor_finish_start_ts = time.time()
+            output = _first_output(self.actor_rollout_wg.finish_actor_accumulate())
+            self._trace_actor_finish_end_ts = time.time()
+            finalized = True
+            self._trace_actor_done_ts = time.time()
+        finally:
+            self.replay_buffer.poll_interval = old_poll
+            try:
+                if started and not finalized:
+                    self.actor_rollout_wg.abort_actor_accumulate()
+            finally:
+                # Padding has its own UID and will not appear in the final real
+                # batch returned to the trainer's normal trajectory cleanup.
+                if padding_keys:
+                    tq.kv_clear(partition_id="train", keys=padding_keys)
+            if self._trace_actor_start_ts is not None:
+                timing_raw["update_actor"] = timing_raw.get("update_actor", 0.0) + (
+                    time.time() - self._trace_actor_start_ts
+                )
+
+        self._trace_actor_chunk_events = chunks
+        batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        if output is not None:
+            self._apply_actor_update_metrics(output, metrics)
+        self._record_gen_split_timing(batch, timing_raw)
+        last_student = max(float(tag["student_gen_done_ts"]) for tag in batch.tags)
+        metrics["actor_rollout_overlap/chunks"] = len(chunks)
+        metrics["actor_rollout_overlap/samples"] = len(consumed)
+        metrics["actor_rollout_overlap/chunks_completed_before_student"] = sum(
+            event["return_ts"] < last_student for event in chunks
+        )
+        metrics["actor_rollout_overlap/samples_completed_before_student"] = sum(
+            event["n"] for event in chunks if event["return_ts"] < last_student
+        )
+        metrics["actor_rollout_overlap/actor_tail_s"] = max(0.0, self._trace_actor_done_ts - last_student)
+        self._dump_actor_timeline(batch)
         return batch
 
     def _stream_actor_with_leftover_teacher(
@@ -395,6 +556,8 @@ class PPOTrainerSync(PPOTrainer):
                     **event,
                     "dispatch_s": rel(event.get("dispatch_ts")),
                     "return_s": rel(event.get("return_ts")),
+                    "chunk_fb_start_s": rel(event.get("chunk_fb_start_ts")),
+                    "chunk_fb_end_s": rel(event.get("chunk_fb_end_ts")),
                 }
             )
         payload = {

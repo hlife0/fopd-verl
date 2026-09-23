@@ -788,6 +788,17 @@ class FSDPEngine(BaseEngine):
         """
         self.optimizer.zero_grad()
 
+    @torch.no_grad()
+    def scale_gradients(self, factor: float):
+        """Rescale accumulated FSDP1 shards / FSDP2 DTensors before clipping.
+
+        The factor commutes with GradScaler unscaling in optimizer_step, which
+        must still happen exactly once after all held chunks have accumulated.
+        """
+        for parameter in self.module.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
+
     def optimizer_step(self):
         """
         Clip gradients, skip update if non-finite, and step optimizer.

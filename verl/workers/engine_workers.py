@@ -14,7 +14,10 @@
 import functools
 import gc
 import logging
+import math
 import os
+import sys
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -157,6 +160,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.loss_fn = None
         self._held_train_ctx = None
         self._held_output_lst = []
+        self._held_loss_normalization_tokens = None
+        self._held_loss_tokens = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -340,13 +345,34 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = None
         return output
 
-    def begin_held_train(self):
+    def begin_held_train(self, loss_normalization_tokens: float | None = None):
         if self._held_train_ctx is not None:
             raise RuntimeError("held train is already open")
+        if loss_normalization_tokens is not None:
+            loss_normalization_tokens = float(loss_normalization_tokens)
+            if not math.isfinite(loss_normalization_tokens) or loss_normalization_tokens <= 0:
+                raise ValueError("loss_normalization_tokens must be finite and positive")
+            if not callable(getattr(self.engine, "scale_gradients", None)):
+                raise NotImplementedError("delayed loss normalization requires an engine with scale_gradients")
         self._held_output_lst = []
-        self._held_train_ctx = self.engine.train_mode()
-        self._held_train_ctx.__enter__()
-        self.engine.optimizer_zero_grad()
+        # Allocate before entering: a failure here must not leave an engine in
+        # training mode. As with a normal `with`, __exit__ is only called after
+        # __enter__ succeeds.
+        loss_tokens = (
+            torch.zeros((), dtype=torch.float64, device=self.device_name)
+            if loss_normalization_tokens is not None
+            else None
+        )
+        ctx = self.engine.train_mode()
+        ctx.__enter__()
+        self._held_train_ctx = ctx
+        self._held_loss_normalization_tokens = loss_normalization_tokens
+        self._held_loss_tokens = loss_tokens
+        try:
+            self.engine.optimizer_zero_grad()
+        except BaseException:
+            self.abort_held_train()
+            raise
 
     def _inject_train_defaults(self, data: TensorDict) -> None:
         default_keys = dict(
@@ -375,21 +401,47 @@ class TrainingWorker(Worker, DistProfilerExtension):
         try:
             grad_norm = None
             lr = None
+            normalization_scale = None
+            loss_tokens = None
             if step:
+                if self._held_loss_normalization_tokens is not None:
+                    # Each rank counted its own masks, including zero-loss padding.
+                    # FSDP averages gradients over DP; the loss already includes
+                    # dp_size, so only C/N (no further world-size factor) remains.
+                    loss_tokens = self._held_loss_tokens.clone()
+                    torch.distributed.all_reduce(loss_tokens, group=self.engine.get_data_parallel_group())
+                    loss_tokens = loss_tokens.item()
+                    if not math.isfinite(loss_tokens) or loss_tokens <= 0:
+                        raise ValueError("held train requires a positive finite total loss token count")
+                    normalization_scale = self._held_loss_normalization_tokens / loss_tokens
+                    self.engine.scale_gradients(normalization_scale)
                 grad_norm = self.engine.optimizer_step()
                 lr = self.engine.lr_scheduler_step()
             if self.engine.is_mp_src_rank_with_outputs():
                 actor_output = [tu.get(output, "metrics") for output in self._held_output_lst]
                 metrics = {}
+                normalized_loss_keys = {"loss"}
                 for output in actor_output:
                     for key, val in output.items():
                         if isinstance(val, list):
+                            if val and isinstance(val[0], Metric) and val[0].aggregation.value == "sum":
+                                normalized_loss_keys.add(key)
                             output[key] = (
                                 Metric.aggregate_dp(val)
                                 if val and isinstance(val[0], Metric)
                                 else list(chain.from_iterable(val))
                             )
+                        elif isinstance(val, Metric):
+                            if val.aggregation.value == "sum":
+                                normalized_loss_keys.add(key)
+                            output[key] = val.aggregate()
                     append_to_dict(metrics, output)
+                if normalization_scale is not None:
+                    # SUM metrics are global loss contributions, just like loss.
+                    # A mean across chunks would depend on the streaming schedule.
+                    for key in normalized_loss_keys & metrics.keys():
+                        metrics[key] = sum(metrics[key]) * normalization_scale
+                    metrics["loss_token_count"] = loss_tokens
                 if grad_norm is not None:
                     metrics["grad_norm"] = grad_norm
                 if lr is not None:
@@ -397,23 +449,31 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             return None
         finally:
-            if ctx is not None:
-                exc = None if step else (RuntimeError, RuntimeError("abort held train"), None)
-                if exc is None:
-                    ctx.__exit__(None, None, None)
-                else:
+            try:
+                if ctx is not None:
+                    exc = sys.exc_info() if step else (RuntimeError, RuntimeError("abort held train"), None)
                     ctx.__exit__(*exc)
-            self._held_train_ctx = None
-            self._held_output_lst = []
+            finally:
+                self._held_train_ctx = None
+                self._held_output_lst = []
+                self._held_loss_normalization_tokens = None
+                self._held_loss_tokens = None
 
     def accumulate_held_train(self, data: TensorDict) -> TensorDict:
         if self._held_train_ctx is None:
             raise RuntimeError("held train is not open")
         maybe_fix_3d_position_ids(data)
         self._inject_train_defaults(data)
+        if self._held_loss_normalization_tokens is not None:
+            tu.assign_non_tensor(data, batch_num_tokens_override=self._held_loss_normalization_tokens)
+            chunk_loss_tokens = data["loss_mask"].sum().detach().to(self._held_loss_tokens)
         global_token_num = self._global_token_num(data)
+        chunk_fb_start_ts = time.time()
         with Timer(name="train_batch", logger=None) as timer:
             output = self.engine.forward_backward_batch(data, loss_function=self.loss_fn, forward_only=False)
+        chunk_fb_end_ts = time.time()
+        if self._held_loss_normalization_tokens is not None:
+            self._held_loss_tokens.add_(chunk_loss_tokens)
         if self.engine.is_mp_src_rank_with_outputs():
             output.pop("model_output", None)
             processed = self._postprocess_output(
@@ -423,6 +483,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 forward_only=False,
                 images_seqlens=tu.get(data, key="images_seqlens", default=None),
             ).cpu()
+            tu.get(processed, "metrics").update(
+                chunk_fb_s=timer.last,
+                chunk_fb_start_ts=chunk_fb_start_ts,
+                chunk_fb_end_ts=chunk_fb_end_ts,
+            )
             self._held_output_lst.append(processed)
         else:
             processed = None
@@ -816,8 +881,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def begin_actor_accumulate(self):
-        self.actor.begin_held_train()
+    def begin_actor_accumulate(self, loss_normalization_tokens: float | None = None):
+        self.actor.begin_held_train(loss_normalization_tokens=loss_normalization_tokens)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
