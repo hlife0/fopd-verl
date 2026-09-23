@@ -299,6 +299,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 "engine_prefill_s": engine_prefill_s,
                 "engine_decode_s": engine_decode_s,
                 "teacher_start_ts": teacher_start_ts,
+                "migration_count": extra.get("migration_count"),
+                "migrated_prefix_tokens": extra.get("migrated_prefix_tokens"),
                 "teacher_done_ts": teacher_done_ts,
                 "teacher_submit_ts": extra.get("teacher_submit_ts"),
                 "teacher_first_token_ts": extra.get("teacher_first_token_ts"),

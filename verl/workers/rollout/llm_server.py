@@ -283,6 +283,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # must carry it forward explicitly or the consumer sees 0. Take the first
         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
         num_cached_tokens = None
+        first_times = {}
+        migration_count = 0
+        migrated_prefix_tokens = 0
 
         while True:
             # 1. generate tokens
@@ -315,6 +318,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             final_output.stop_reason = output.stop_reason
             if output.extra_fields:
                 final_output.extra_fields.update(output.extra_fields)
+                for name in ("student_submit_ts", "student_first_token_ts", "engine_arrival_ts"):
+                    if output.extra_fields.get(name) is not None:
+                        first_times.setdefault(name, output.extra_fields[name])
+                final_output.extra_fields.update(first_times)
 
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:
@@ -342,12 +349,17 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
+            migration_count += 1
+            migrated_prefix_tokens = len(final_output.token_ids)
+
             await asyncio.sleep(1)
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
+        final_output.extra_fields["migration_count"] = migration_count
+        final_output.extra_fields["migrated_prefix_tokens"] = migrated_prefix_tokens
         return final_output
 
 

@@ -150,3 +150,38 @@ def test_barrier_times_out_instead_of_hanging(monkeypatch):
         assert server.engine.pause_calls == 1, "barrier must proceed rather than deadlock"
 
     asyncio.run(main())
+
+
+def test_migration_releases_already_parked_and_late_admissions():
+    async def main():
+        server = _make_server()
+        server._migration_evacuated = False
+        server._submission_paused = True
+        server._resume_event.clear()
+        parked = asyncio.create_task(server._acquire_generation_admission())
+        await asyncio.sleep(0)
+        assert not parked.done()
+        await server.migrate_requests()
+        assert await asyncio.wait_for(parked, timeout=1) is False
+        assert await server._acquire_generation_admission() is False
+        assert server._admitting == 0
+        await server.resume_generation()
+        assert server._migration_evacuated is False
+        assert await server._acquire_generation_admission() is True
+        assert server._admitting == 1
+    asyncio.run(main())
+
+
+def test_migration_waits_for_acquired_request_to_reach_engine_before_abort():
+    async def main():
+        server = _make_server()
+        assert await server._acquire_generation_admission() is True
+        migrating = asyncio.create_task(server.migrate_requests())
+        await asyncio.sleep(0.02)
+        assert not migrating.done() and server.engine.pause_calls == 0
+        assert await server._acquire_generation_admission() is False
+        server._admitting -= 1
+        await asyncio.wait_for(migrating, timeout=1)
+        assert server.engine.pause_calls == 1
+        assert server.engine.admitting_at_pause == 0
+    asyncio.run(main())

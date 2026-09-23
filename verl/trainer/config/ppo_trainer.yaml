@@ -251,6 +251,15 @@ trainer:
       # Positive values must be divisible by Actor DP size.
       actor_rollout_overlap_chunk_size: 0
 
+      # Route 2: migrate the last rollout replica and train there before the barrier.
+      actor_rollout_migrate: false
+
+      # Fraction of Student trajectories completed before requesting migration.
+      actor_rollout_migrate_after_fraction: 0.5
+
+      # Real trajectories per early F/B chunk; 0 uses the early group's DP size.
+      actor_rollout_migrate_chunk_size: 0
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

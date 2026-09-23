@@ -173,6 +173,7 @@ class vLLMHttpServer:
         # vLLM's pause stops requests being scheduled but still accepts them, and a request
         # admitted after the pause is invisible to the drain's liveness check.
         self._submission_paused = False
+        self._migration_evacuated = False
         self._admitting = 0
         self._resume_event = asyncio.Event()
         self._resume_event.set()
@@ -672,12 +673,11 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        # No await between the final gate check and the bump: on the actor's single event loop
-        # that keeps "gate closed and _admitting == 0" from being observed mid-admission.
-        while self._submission_paused:
-            logger.debug("parking request %s until weight sync completes", request_id)
-            await self._resume_event.wait()
-        self._admitting += 1
+        if not await self._acquire_generation_admission():
+            # Acquired from the router before removal, but reached this server
+            # after evacuation: return to the client so it retries elsewhere.
+            return TokenOutput(token_ids=[], log_probs=[], stop_reason="aborted",
+                               extra_fields={"global_steps": self.global_steps})
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
             generator = self.engine.generate(
@@ -988,6 +988,15 @@ class vLLMHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
+    async def _acquire_generation_admission(self):
+        while self._submission_paused:
+            if getattr(self, "_migration_evacuated", False):
+                return False
+            await self._resume_event.wait()
+        # No await between the final gate check and this increment.
+        self._admitting += 1
+        return True
+
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
@@ -1054,11 +1063,20 @@ class vLLMHttpServer:
             logger.exception("Error aborting requests")
             raise
 
+    async def migrate_requests(self):
+        """Evacuate this replica; late admissions return aborted instead of parking."""
+        self._migration_evacuated = True
+        report = await self.abort_all_requests(reset_prefix_cache=True)
+        # Also release callers that were already waiting on the admission gate.
+        self._resume_event.set()
+        return report
+
     async def resume_generation(self):
         """Resume generation after abort_all_requests (pause_generation)."""
         # Before the node_rank guard: every server in the replica closed the gate, so every
         # server must reopen it.
         self._submission_paused = False
+        self._migration_evacuated = False
         self._resume_event.set()
         if self.node_rank != 0:
             return

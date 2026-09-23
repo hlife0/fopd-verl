@@ -13,10 +13,14 @@
 # limitations under the License.
 import json
 import logging
+import math
+from copy import deepcopy
 import os
 import time
 
 import transfer_queue as tq
+import ray
+from omegaconf import open_dict
 from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
@@ -62,10 +66,28 @@ class PPOTrainerSync(PPOTrainer):
     2. Partial rollout is disabled
     """
 
+    def _setup(self):
+        if self.config.trainer.v1.sync.get("actor_rollout_migrate", False):
+            from verl.utils.torch_dtypes import PrecisionType
+            import torch
+            precision = self.config.actor_rollout_ref.actor.fsdp_config.get("mixed_precision") or {}
+            if PrecisionType.to_dtype(precision.get("param_dtype", "bf16")) == torch.float16:
+                raise ValueError("actor_rollout_migrate supports BF16/FP32, not FP16 GradScaler training")
+            with open_dict(self.config.actor_rollout_ref.actor.fsdp_config):
+                self.config.actor_rollout_ref.actor.fsdp_config.use_orig_params = True
+        super()._setup()
+
+    def get_llm_client(self):
+        if self.config.trainer.v1.sync.get("actor_rollout_migrate", False):
+            from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+            return self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient)
+        return super().get_llm_client()
+
     def on_init_end(self):
         self._configure_opd_no_task_reward_fast_path()
         self._configure_early_actor_lite()
         self._configure_actor_rollout_overlap()
+        self._configure_actor_rollout_migrate()
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -179,9 +201,222 @@ class PPOTrainerSync(PPOTrainer):
             raise ValueError("actor_rollout_overlap_chunk_size must be nonnegative")
         logger.info("actor_rollout_overlap: accumulate scored trajectories before the Student barrier")
 
+    def _configure_actor_rollout_migrate(self):
+        cfg = self.config.trainer.v1.sync
+        self.actor_rollout_migrate = bool(cfg.get("actor_rollout_migrate", False))
+        if not self.actor_rollout_migrate:
+            return
+        if self.actor_rollout_overlap or not self.early_actor_stream_fb:
+            raise ValueError("actor_rollout_migrate requires early_actor_lite OPD streaming and disables route 1")
+        actor = self.config.actor_rollout_ref.actor
+        rollout = self.config.actor_rollout_ref.rollout
+        if actor.loss_agg_mode != "token-mean" or self.parameter_sync_step != 1:
+            raise ValueError("actor_rollout_migrate requires token-mean and parameter_sync_step=1")
+        if actor.fsdp_config.ulysses_sequence_parallel_size != 1 or actor.fsdp_config.forward_only:
+            raise ValueError("actor_rollout_migrate requires FSDP training without sequence parallelism")
+        if self.distillation_config.teacher_follow:
+            raise ValueError("actor_rollout_migrate currently requires teacher_follow=false")
+        if rollout.name != "vllm" or rollout.data_parallel_size != 1 or rollout.pipeline_model_parallel_size != 1:
+            raise ValueError("actor_rollout_migrate requires vLLM TP replicas without PP/engine DP")
+        if self.config.trainer.nnodes != 1 or len(self.llm_server_manager.rollout_replicas) < 2:
+            raise ValueError("actor_rollout_migrate requires one node and at least two rollout replicas")
+        self._migration_fraction = float(cfg.actor_rollout_migrate_after_fraction)
+        if not 0 < self._migration_fraction < 1:
+            raise ValueError("actor_rollout_migrate_after_fraction must lie strictly between 0 and 1")
+        self._migration_dp = int(rollout.tensor_model_parallel_size)
+        self._migration_chunk = int(cfg.actor_rollout_migrate_chunk_size) or self._migration_dp
+        if self._migration_chunk < self._migration_dp or self._migration_chunk % self._migration_dp:
+            raise ValueError("actor_rollout_migrate_chunk_size must be divisible by early FSDP DP size")
+        from verl.single_controller.ray.base import RayClassWithInitArgs, RayWorkerGroup, split_resource_pool
+        from verl.trainer.ppo.utils import Role
+        from verl.workers.engine_workers import ActorRolloutRefWorker
+        role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        pool = self.resource_pool_manager.get_resource_pool(role)
+        early_pool = split_resource_pool(pool, [pool.world_size - self._migration_dp, self._migration_dp])[-1]
+        early_config = deepcopy(self.config.actor_rollout_ref)
+        with open_dict(early_config.actor.fsdp_config):
+            early_config.actor.fsdp_config.param_offload = True
+            early_config.actor.fsdp_config.optimizer_offload = False
+        self.migration_actor_wg = RayWorkerGroup(
+            resource_pool=early_pool,
+            ray_cls_with_init=RayClassWithInitArgs(
+                cls=ray.remote(ActorRolloutRefWorker), config=early_config, role="actor",
+                distillation_config=self.config.distillation, migration_fb_only=True,
+            ),
+            name_prefix="migration_actor", device_name=self.config.trainer.device,
+        )
+        self.migration_actor_wg.init_model()
+        self._migration_units = self.actor_rollout_wg.migration_units()[0]
+        if self.migration_actor_wg.migration_units()[0] != self._migration_units:
+            raise ValueError("Main and early FSDP wrapping must use identical parameter units")
+
+    def _sync_migration_weights(self):
+        # One FSDP unit at a time bounds host/transport copies. This cost belongs
+        # to the step's prepare phase; no uncounted background parameter copies.
+        self.migration_actor_wg.to("device", optimizer=False, grad=False)
+        main_offload = self.config.actor_rollout_ref.actor.fsdp_config.param_offload
+        if main_offload:
+            self.actor_rollout_wg.to("device", optimizer=False, grad=False)
+        try:
+            for unit in self._migration_units:
+                values = _first_output(self.actor_rollout_wg.export_migration_unit(unit))
+                self.migration_actor_wg.import_migration_unit(unit, values)
+                del values
+        finally:
+            self.migration_actor_wg.to("cpu", optimizer=False, grad=False)
+            if main_offload:
+                self.actor_rollout_wg.to("cpu", optimizer=False, grad=False)
+
+    def _migrate_and_train(self, metrics, timing_raw, sample_batch_size):
+        from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
+        from verl.utils.ray_utils import auto_await
+        prompts = self._actor_overlap_prompt_uids
+        if len(prompts) != sample_batch_size:
+            raise RuntimeError("Migration logical batch differs from submitted prompts")
+        manager = self.llm_server_manager
+        replica = manager.rollout_replicas[-1]
+        address = manager.server_addresses[-1]
+        main_dp = self._actor_dp_size()
+        threshold = math.ceil(sample_batch_size * self._migration_fraction)
+        consumed = set()
+        padded_keys = []
+        events = []
+        migrated = early_started = main_started = asleep = finalized = False
+        early_tokens = 0.0
+        early_state = None
+        old_poll = self.replay_buffer.poll_interval
+        self.replay_buffer.poll_interval = min(old_poll, 0.05)
+        denominator = sample_batch_size * int(self.config.data.max_response_length)
+        gen_start = time.time()
+        self._trace_actor_start_ts = None
+        try:
+            self.on_sample_begin()
+            while len(consumed) < sample_batch_size:
+                students, ready = self.replay_buffer.peek_actor_overlap_batch("train", prompts, self.global_steps)
+                all_students = len(students) == sample_batch_size
+                if not migrated and not all_students and len(students) >= threshold and ready:
+                    migrate_start = time.time()
+                    ray.get(manager.global_load_balancer.remove_servers.remote([address]))
+                    migrated = True
+                    reports = ray.get([server.migrate_requests.remote() for server in replica.servers])
+                    metrics["actor_rollout_migrate/aborted_requests"] = sum(r["aborted_count"] for r in reports)
+                    auto_await(replica.sleep)()
+                    timing_raw["migration"] = time.time() - migrate_start
+                    self._migration_start_ts = migrate_start
+                    self._migration_done_ts = time.time()
+                if all_students and not asleep:
+                    self._trace_student_barrier_ts = time.time()
+                    self._trace_sleep_start_ts = time.time()
+                    # The evacuated replica is already asleep; sleep only remaining replicas.
+                    replicas = manager.rollout_replicas[:-1] if migrated else manager.rollout_replicas
+                    for item in replicas:
+                        auto_await(item.sleep)()
+                    self._trace_sleep_end_ts = time.time()
+                    asleep = True
+                    timing_raw["gen"] = time.time() - gen_start
+                    if early_started:
+                        early_state = self.migration_actor_wg.migration_loss_state()[0]
+                        early_tokens = early_state["tokens"]
+                    main_started = True
+                    self.actor_rollout_wg.begin_actor_accumulate(loss_normalization_tokens=denominator)
+                    if self._trace_actor_start_ts is None:
+                        self._trace_actor_start_ts = time.time()
+                available = [key for key in ready if key not in consumed]
+                remaining = sample_batch_size - len(consumed)
+                if asleep:
+                    take_n = min(len(available), main_dp)
+                    if len(available) < remaining:
+                        take_n -= take_n % main_dp
+                    group, dp, phase = self.actor_rollout_wg, main_dp, "main"
+                elif migrated:
+                    # Keep one full main DP chunk so every main rank has valid
+                    # gradient storage before importing the early contribution.
+                    take_n = min(len(available), self._migration_chunk, remaining - main_dp)
+                    take_n = max(0, take_n - take_n % self._migration_dp)
+                    group, dp, phase = self.migration_actor_wg, self._migration_dp, "early"
+                else:
+                    take_n = 0
+                if not take_n:
+                    time.sleep(self.replay_buffer.poll_interval)
+                    continue
+                take = available[:take_n]
+                chunk = students.select_keys(take)
+                expected_version = self.global_steps - 1
+                if any(
+                    tag.get("min_global_steps") != expected_version
+                    or tag.get("max_global_steps") != expected_version
+                    for tag in chunk.tags
+                ):
+                    raise RuntimeError(
+                        f"Migration trajectories must use frozen rollout weight version {expected_version}"
+                    )
+                chunk.extra_info.update(self._actor_update_extra_info())
+                chunk = upsample_batch_to_divisible_size(chunk, dp, self.tokenizer.eos_token_id)
+                padded_keys.extend(key for key, tag in zip(chunk.keys, chunk.tags, strict=True) if tag.get("is_padding"))
+                if phase == "early" and not early_started:
+                    self._trace_actor_start_ts = time.time()
+                    early_started = True
+                    group.begin_actor_accumulate(loss_normalization_tokens=denominator)
+                dispatch_ts = time.time()
+                result = group.accumulate_actor(chunk)
+                events.append({"n": take_n, "phase": phase, "dispatch_ts": dispatch_ts,
+                               "return_ts": time.time(), "chunk_fb_s": _chunk_fb_s(result)})
+                consumed.update(take)
+                if phase == "main" and early_started:
+                    # The first main chunk allocated gradient storage. Merge now
+                    # and release the early model before the remaining main F/B.
+                    merge_start = time.time()
+                    for unit in self._migration_units:
+                        values = _first_output(self.migration_actor_wg.export_migration_unit(unit, gradients=True))
+                        self.actor_rollout_wg.import_migration_unit(unit, values, gradients=True)
+                        del values
+                    self.actor_rollout_wg.add_migration_loss_state(early_state)
+                    self.migration_actor_wg.abort_actor_accumulate()
+                    early_started = False
+                    timing_raw["migration_gradient_merge"] = time.time() - merge_start
+            batch = self.replay_buffer.materialize_actor_overlap_batch("train", prompts, self.global_steps)
+            self._trace_actor_finish_start_ts = time.time()
+            result = _first_output(self.actor_rollout_wg.finish_actor_accumulate())
+            self._trace_actor_finish_end_ts = self._trace_actor_done_ts = time.time()
+            finalized = True
+        finally:
+            self.replay_buffer.poll_interval = old_poll
+            try:
+                if early_started:
+                    self.migration_actor_wg.abort_actor_accumulate()
+                if main_started and not finalized:
+                    self.actor_rollout_wg.abort_actor_accumulate()
+            finally:
+                if padded_keys:
+                    tq.kv_clear(partition_id="train", keys=padded_keys)
+                if migrated and not finalized:
+                    auto_await(replica.wake_up)()
+                    ray.get([server.resume_generation.remote() for server in replica.servers])
+                    ray.get(manager.global_load_balancer.add_servers.remote({address: manager.server_handles[-1]}))
+            if self._trace_actor_start_ts is not None:
+                timing_raw["update_actor"] = time.time() - self._trace_actor_start_ts
+        self._trace_actor_chunk_events = events
+        self._apply_actor_update_metrics(result, metrics)
+        batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        self._record_gen_split_timing(batch, timing_raw)
+        last_student = max(float(tag["student_gen_done_ts"]) for tag in batch.tags)
+        metrics["actor_rollout_migrate/enabled"] = 1
+        metrics["actor_rollout_migrate/early_samples"] = sum(e["n"] for e in events if e["phase"] == "early")
+        metrics["actor_rollout_migrate/early_samples_completed_before_student"] = sum(
+            e["n"] for e in events if e["phase"] == "early" and e["return_ts"] < last_student
+        )
+        metrics["actor_rollout_migrate/migrated_trajectories"] = sum(bool(tag.get("migration_count")) for tag in batch.tags)
+        metrics["actor_rollout_migrate/migrated_prefix_tokens"] = sum(tag.get("migrated_prefix_tokens", 0) for tag in batch.tags)
+        metrics["actor_rollout_migrate/early_loss_tokens"] = early_tokens
+        self._dump_actor_timeline(batch)
+        self._migration_replica_removed = migrated
+        return batch
+
     def prepare_step(self) -> dict:
-        if not getattr(self, "actor_rollout_overlap", False):
+        if not (getattr(self, "actor_rollout_overlap", False) or getattr(self, "actor_rollout_migrate", False)):
             return super().prepare_step()
+        if getattr(self, "actor_rollout_migrate", False):
+            self._sync_migration_weights()
         batch = self._next_train_batch()
         # Capture the actual submitted IDs, rather than selecting any ready groups
         # left in the queue (which can belong to another logical batch).
@@ -190,6 +425,8 @@ class PPOTrainerSync(PPOTrainer):
         return {}
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int):
+        if getattr(self, "actor_rollout_migrate", False):
+            return self._migrate_and_train(metrics, timing_raw, sample_batch_size)
         if getattr(self, "actor_rollout_overlap", False):
             return self._stream_actor_during_rollout(metrics, timing_raw, sample_batch_size)
         if not self.early_actor_lite:
@@ -590,6 +827,11 @@ class PPOTrainerSync(PPOTrainer):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
             self.checkpoint_manager.update_weights(self.global_steps)
+        if getattr(self, "_migration_replica_removed", False):
+            manager = self.llm_server_manager
+            ray.get([server.resume_generation.remote() for server in manager.rollout_replicas[-1].servers])
+            ray.get(manager.global_load_balancer.add_servers.remote({manager.server_addresses[-1]: manager.server_handles[-1]}))
+            self._migration_replica_removed = False
         self._trace_weights_done_ts = time.time()
 
     def on_sample_end(self):

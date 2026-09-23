@@ -170,3 +170,34 @@ async def test_config_without_rollout_section_is_tolerated(server):
     output = await _generate(SimpleNamespace(), 136, {"temperature": 1.0})
 
     assert len(output.token_ids) > 0
+
+
+@pytest.mark.asyncio
+async def test_migration_preserves_accepted_tokens_logprobs_budget_and_original_timestamps(monkeypatch):
+    outputs = [
+        TokenOutput(token_ids=[11, 12], log_probs=[-0.1, -0.2], stop_reason="aborted",
+                    extra_fields={"global_steps": 7, "student_submit_ts": 10., "student_first_token_ts": 11.,
+                                  "student_last_token_ts": 12.}),
+        TokenOutput(token_ids=[13, 14, 15], log_probs=[-0.3, -0.4, -0.5], stop_reason="length",
+                    extra_fields={"global_steps": 7, "student_submit_ts": 20., "student_first_token_ts": 21.,
+                                  "student_last_token_ts": 22.}),
+    ]
+    calls = []
+    async def generate(self, request_id, *, prompt_ids, sampling_params, **kwargs):
+        calls.append((list(prompt_ids), dict(sampling_params)))
+        return outputs[len(calls) - 1]
+    async def no_wait(delay):
+        return None
+    monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
+    monkeypatch.setattr(llm_server.asyncio, "sleep", no_wait)
+    client = FullyAsyncLLMServerClient(config=_config(include_async_training=False))
+    output = await client.generate("move", prompt_ids=[1, 2], sampling_params={"max_tokens": 5})
+    assert calls == [([1, 2], {"max_tokens": 5}), ([1, 2, 11, 12], {"max_tokens": 3})]
+    assert output.token_ids == [11, 12, 13, 14, 15]
+    assert output.log_probs == [-0.1, -0.2, -0.3, -0.4, -0.5]
+    assert output.extra_fields["student_submit_ts"] == 10.
+    assert output.extra_fields["student_first_token_ts"] == 11.
+    assert output.extra_fields["student_last_token_ts"] == 22.
+    assert output.extra_fields["migration_count"] == 1
+    assert output.extra_fields["migrated_prefix_tokens"] == 2
+    assert output.extra_fields["min_global_steps"] == output.extra_fields["max_global_steps"] == 7

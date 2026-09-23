@@ -421,8 +421,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 actor_output = [tu.get(output, "metrics") for output in self._held_output_lst]
                 metrics = {}
                 normalized_loss_keys = {"loss"}
+                extrema_reducers = {}
                 for output in actor_output:
                     for key, val in output.items():
+                        metric = val[0] if isinstance(val, list) and val else val
+                        if isinstance(metric, Metric) and metric.aggregation.value in ("min", "max"):
+                            extrema_reducers[key] = min if metric.aggregation.value == "min" else max
                         if isinstance(val, list):
                             if val and isinstance(val[0], Metric) and val[0].aggregation.value == "sum":
                                 normalized_loss_keys.add(key)
@@ -436,6 +440,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                                 normalized_loss_keys.add(key)
                             output[key] = val.aggregate()
                     append_to_dict(metrics, output)
+                for key, reducer in extrema_reducers.items():
+                    metrics[key] = reducer(metrics[key])
                 if normalization_scale is not None:
                     # SUM metrics are global loss contributions, just like loss.
                     # A mean across chunks would depend on the streaming schedule.
@@ -626,10 +632,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ref_worker_cls = TrainingWorker
 
     def __init__(
-        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
+        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None,
+        migration_fb_only: bool = False, **kwargs
     ):
         Worker.__init__(self)
         self.config = config
+        self.migration_fb_only = migration_fb_only
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.role = role
@@ -774,7 +782,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_type=actor_config.model_config.get("model_type", "language_model"),
                 model_config=actor_config.model_config,
                 engine_config=actor_config.engine,
-                optimizer_config=actor_config.optim,
+                optimizer_config=None if self.migration_fb_only else actor_config.optim,
                 checkpoint_config=actor_config.checkpoint,
                 profiler_config=actor_profiler_config,
             )
@@ -898,6 +906,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def abort_actor_accumulate(self):
         self.actor.abort_held_train()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def migration_units(self):
+        from verl.workers.engine.fsdp.migration import unit_names
+        if self.actor.engine.scaler is not None:
+            raise ValueError("Migration gradient exchange currently requires training without GradScaler")
+        return unit_names(self.actor.engine.module)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_migration_unit(self, unit: str, gradients: bool = False):
+        from verl.workers.engine.fsdp.migration import export_unit
+        return export_unit(self.actor.engine.module, unit, gradients=gradients)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def import_migration_unit(self, unit: str, values: dict, gradients: bool = False):
+        from verl.workers.engine.fsdp.migration import import_unit
+        import_unit(self.actor.engine.module, unit, values, gradients=gradients)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def migration_loss_state(self):
+        tokens = self.actor._held_loss_tokens.clone()
+        torch.distributed.all_reduce(tokens, group=self.actor.engine.get_data_parallel_group())
+        return {"tokens": float(tokens.item()), "outputs": self.actor._held_output_lst}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def add_migration_loss_state(self, state: dict):
+        if self.actor._held_train_ctx is None:
+            raise RuntimeError("Main Actor held training must begin before migration import")
+        if self.actor.engine.get_data_parallel_rank() == 0:
+            self.actor._held_loss_tokens.add_(state["tokens"])
+        # Each held output already contains DP-reduced metrics. All main ranks
+        # need the same early contributions before finish applies C/N once.
+        self.actor._held_output_lst.extend(state["outputs"])
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
