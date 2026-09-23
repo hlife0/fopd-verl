@@ -144,6 +144,9 @@ class PPOTrainer(ABC):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
+        self.separate_rollout = bool(self.config.trainer.v1.get("sync", {}).get("separate_rollout", False))
+        if self.separate_rollout and self.trainer_mode != "sync":
+            raise ValueError("sync.separate_rollout requires trainer_mode=sync")
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
@@ -254,7 +257,11 @@ class PPOTrainer(ABC):
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # 1. define actor and rollout class
-        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        actor_role = (
+            Role.Actor
+            if self.separate_rollout
+            else Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        )
         actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
         actor_rollout_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[actor_role],
@@ -366,26 +373,36 @@ class PPOTrainer(ABC):
             self.teacher_model_manager = None
             self.distillation_config = None
 
-        # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        # 9/10. initialize generation servers and their weight transport.
+        self._init_rollout_and_checkpoint_manager(actor_rollout_resource_pool)
 
-        # 10. initialize checkpoint engine manager
+        # Dedicated rollout stays resident while the independent Actor restores.
+        if not self.separate_rollout:
+            self.checkpoint_manager.sleep_replicas()
+        self._load_checkpoint()
+
+        logger.info("all initialize finished, ready to fit")
+
+    def _init_rollout_and_checkpoint_manager(self, actor_rollout_resource_pool):
+        if self.separate_rollout:
+            # Omitting worker_group creates only standalone replicas on their
+            # own resource pools, never a hidden hybrid vLLM on the Actor GPUs.
+            self.llm_server_manager = LLMServerManager.create(config=self.config)
+        else:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
+        if not self.separate_rollout:
+            checkpoint_engine_config.backend = "naive"
         self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
         )
         logger.info("checkpoint engine manager initialized")
-
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
-        self._load_checkpoint()
-
-        logger.info("all initialize finished, ready to fit")
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
@@ -773,7 +790,11 @@ class PPOTrainer(ABC):
         manager.  Modes that use additional dedicated GPUs (e.g. separate-async
         standalone rollout) should override this to include them.
         """
-        return self.resource_pool_manager.get_n_gpus()
+        count = self.resource_pool_manager.get_n_gpus()
+        if getattr(self, "separate_rollout", False):
+            rollout = self.config.actor_rollout_ref.rollout
+            count += rollout.nnodes * rollout.n_gpus_per_node
+        return count
 
     def _init_tokenizer(self):
         """Initialize tokenizer and processor from the model config."""
@@ -875,7 +896,11 @@ class PPOTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        role = (
+            Role.Actor
+            if getattr(self, "separate_rollout", False)
+            else Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        )
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 

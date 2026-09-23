@@ -251,6 +251,11 @@ trainer:
       # Positive values must be divisible by Actor DP size.
       actor_rollout_overlap_chunk_size: 0
 
+      # Route 3: dedicate trainer GPUs to Actor and rollout.{nnodes,n_gpus_per_node}
+      # to standalone generation. Requires overlap, NCCL sync, and no offload/sleep.
+      # The batch remains synchronous; no next-batch prefetch uses old weights.
+      separate_rollout: false
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

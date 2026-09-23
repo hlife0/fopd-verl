@@ -58,9 +58,51 @@ def _chunk_fb_s(output) -> float | None:
 @register_trainer("sync")
 class PPOTrainerSync(PPOTrainer):
     """Synchronous PPO trainer
-    1. Trainer and rollout are colocated
+    1. Trainer and rollout are colocated, or use fixed separate resource pools
     2. Partial rollout is disabled
     """
+
+    def _setup(self):
+        self._configure_separate_rollout()
+        super()._setup()
+
+    def _configure_separate_rollout(self):
+        """Route 3: fixed Actor, rollout and Teacher pools with a sync batch barrier."""
+        sync = self.config.trainer.v1.sync
+        self.separate_rollout = bool(sync.get("separate_rollout", False))
+        if not self.separate_rollout:
+            return
+        if self.config.trainer.v1.trainer_mode != "sync":
+            raise ValueError("separate_rollout requires trainer_mode=sync")
+        if not all(
+            sync.get(key, False)
+            for key in ("actor_rollout_overlap", "early_actor_lite", "opd_no_task_reward_fast_path")
+        ):
+            raise ValueError("separate_rollout requires actor_rollout_overlap, early_actor_lite and the OPD fast path")
+        rollout = self.config.actor_rollout_ref.rollout
+        actor = self.config.actor_rollout_ref.actor
+        if rollout.nnodes <= 0 or rollout.n_gpus_per_node <= 0:
+            raise ValueError("separate_rollout requires a positive dedicated rollout GPU allocation")
+        replica_size = (
+            rollout.tensor_model_parallel_size * rollout.data_parallel_size * rollout.pipeline_model_parallel_size
+        )
+        if (rollout.nnodes * rollout.n_gpus_per_node) % replica_size:
+            raise ValueError("dedicated rollout GPU count must be divisible by the replica TP/DP/PP size")
+        if rollout.name != "vllm" or rollout.checkpoint_engine.backend != "nccl":
+            raise ValueError("separate_rollout currently requires vllm with checkpoint_engine.backend=nccl")
+        if rollout.free_cache_engine or rollout.enable_sleep_mode:
+            raise ValueError("separate_rollout requires free_cache_engine=false and enable_sleep_mode=false")
+        if actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("separate_rollout requires FSDP/FSDP2")
+        if actor.fsdp_config.param_offload or actor.fsdp_config.optimizer_offload:
+            raise ValueError("separate_rollout requires Actor parameter and optimizer offload disabled")
+        if self.use_reference_policy or self.use_critic:
+            raise ValueError("separate_rollout requires critic and reference policies disabled")
+        if self.config.reward.reward_model.enable and not self.config.reward.reward_model.enable_resource_pool:
+            raise ValueError("separate_rollout does not support a reward model colocated with Actor")
+        logger.info(
+            "separate_rollout: fixed Actor / standalone rollout / Teacher pools, one synchronous batch at a time"
+        )
 
     def on_init_end(self):
         self._configure_opd_no_task_reward_fast_path()
@@ -85,6 +127,8 @@ class PPOTrainerSync(PPOTrainer):
             metrics["early_actor_lite/stream_fb"] = int(getattr(self, "early_actor_stream_fb", False))
         if getattr(self, "actor_rollout_overlap", False):
             metrics["actor_rollout_overlap/enabled"] = 1
+        if getattr(self, "separate_rollout", False):
+            metrics["separate_rollout/enabled"] = 1
         return batch
 
     def _configure_opd_no_task_reward_fast_path(self) -> None:
@@ -146,7 +190,9 @@ class PPOTrainerSync(PPOTrainer):
             and not getattr(self, "use_critic", False)
             and not getattr(self, "use_reference_policy", False)
         )
-        if self.early_actor_stream_fb:
+        if self.early_actor_stream_fb and getattr(self, "separate_rollout", False):
+            logger.info("early_actor_lite: stream Actor F/B while dedicated Student and Teacher remain resident")
+        elif self.early_actor_stream_fb:
             logger.info(
                 "early_actor_lite: sleep Student vLLM after the Student barrier, then stream "
                 "Actor F/B on teacher-ready samples while leftover Teacher scoring continues"
@@ -292,7 +338,7 @@ class PPOTrainerSync(PPOTrainer):
         consumed: set[str] = set()
         chunks: list[dict] = []
         padding_keys: list[str] = []
-        started = finalized = students_asleep = False
+        started = finalized = student_barrier_reached = False
         old_poll = self.replay_buffer.poll_interval
         self.replay_buffer.poll_interval = min(old_poll, 0.05)
         gen_start = time.time()
@@ -305,13 +351,15 @@ class PPOTrainerSync(PPOTrainer):
                 students, teacher_ready = self.replay_buffer.peek_actor_overlap_batch(
                     "train", prompt_uids, self.global_steps
                 )
-                if len(students.keys) == sample_batch_size and not students_asleep:
+                if len(students.keys) == sample_batch_size and not student_barrier_reached:
                     self._trace_student_barrier_ts = time.time()
-                    self._trace_sleep_start_ts = time.time()
+                    if not getattr(self, "separate_rollout", False):
+                        self._trace_sleep_start_ts = time.time()
                     self.on_sample_end()
-                    self._trace_sleep_end_ts = time.time()
+                    if not getattr(self, "separate_rollout", False):
+                        self._trace_sleep_end_ts = time.time()
                     timing_raw["gen"] = timing_raw.get("gen", 0.0) + time.time() - gen_start
-                    students_asleep = True
+                    student_barrier_reached = True
                 ready = [key for key in teacher_ready if key not in consumed]
                 remaining = sample_batch_size - len(consumed)
                 take_n = min(len(ready), chunk_cap)
@@ -323,6 +371,16 @@ class PPOTrainerSync(PPOTrainer):
                     continue
                 take = ready[:take_n]
                 chunk = students.select_keys(take)
+                if getattr(self, "separate_rollout", False):
+                    expected_version = self.global_steps - 1
+                    if any(
+                        tag.get("min_global_steps") != expected_version
+                        or tag.get("max_global_steps") != expected_version
+                        for tag in chunk.tags
+                    ):
+                        raise RuntimeError(
+                            "separate_rollout requires every trajectory to use the published Actor version"
+                        )
                 chunk.extra_info.update(self._actor_update_extra_info())
                 chunk = self._balance_batch(
                     chunk, metrics=metrics, logging_prefix="early_actor_chunk", align_to_mini_batch=False
@@ -357,7 +415,7 @@ class PPOTrainerSync(PPOTrainer):
             # Every consumed group is terminal and immutable. Validate and consume
             # this exact set before the only optimizer update, never generic sample().
             batch = self.replay_buffer.materialize_actor_overlap_batch("train", prompt_uids, self.global_steps)
-            if not students_asleep:
+            if not student_barrier_reached:
                 raise RuntimeError("actor_rollout_overlap completed training before the Student barrier")
             self._trace_actor_finish_start_ts = time.time()
             output = _first_output(self.actor_rollout_wg.finish_actor_accumulate())
@@ -588,12 +646,15 @@ class PPOTrainerSync(PPOTrainer):
     def on_step_end(self):
         self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):
-            # wake up all replicas to update weights
-            self.checkpoint_manager.update_weights(self.global_steps)
+            # Publish after the only optimizer step; the next batch starts only
+            # after every replica has received this version.
+            self._pending_sync_metrics = self.checkpoint_manager.update_weights(self.global_steps)
         self._trace_weights_done_ts = time.time()
 
     def on_sample_end(self):
-        # sleep all replicas to discard weights and kv cache
-        self.checkpoint_manager.sleep_replicas()
+        # Standalone generation keeps weights and KV allocation resident. Its
+        # checkpoint transport clears old-version caches when publishing.
+        if not getattr(self, "separate_rollout", False):
+            self.checkpoint_manager.sleep_replicas()
         if self.curr_step_profile:
             self._stop_rollout_profiling()
