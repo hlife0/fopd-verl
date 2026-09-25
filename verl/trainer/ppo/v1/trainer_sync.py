@@ -79,6 +79,8 @@ class PPOTrainerSync(PPOTrainer):
             for key in ("actor_rollout_overlap", "early_actor_lite", "opd_no_task_reward_fast_path")
         ):
             raise ValueError("separate_rollout requires actor_rollout_overlap, early_actor_lite and the OPD fast path")
+        if int(sync.get("actor_rollout_overlap_chunk_size", 0)) != 0:
+            raise ValueError("separate_rollout requires actor_rollout_overlap_chunk_size=0 to drain all ready samples")
         rollout = self.config.actor_rollout_ref.rollout
         actor = self.config.actor_rollout_ref.actor
         if rollout.nnodes <= 0 or rollout.n_gpus_per_node <= 0:
@@ -332,7 +334,8 @@ class PPOTrainerSync(PPOTrainer):
             raise RuntimeError("actor_rollout_overlap submitted prompt count differs from the logical batch")
         dp_size = self._actor_dp_size()
         chunk_cap = int(self.config.trainer.v1.sync.get("actor_rollout_overlap_chunk_size", 0)) or dp_size
-        if chunk_cap < dp_size or chunk_cap % dp_size:
+        separate_rollout = getattr(self, "separate_rollout", False)
+        if not separate_rollout and (chunk_cap < dp_size or chunk_cap % dp_size):
             raise ValueError("actor_rollout_overlap_chunk_size must be a positive multiple of Actor DP size")
         denominator = sample_batch_size * int(self.config.data.max_response_length)
         consumed: set[str] = set()
@@ -362,10 +365,15 @@ class PPOTrainerSync(PPOTrainer):
                     student_barrier_reached = True
                 ready = [key for key in teacher_ready if key not in consumed]
                 remaining = sample_batch_size - len(consumed)
-                take_n = min(len(ready), chunk_cap)
-                # Only the final chunk may need synthetic zero-loss padding.
-                if len(ready) < remaining:
-                    take_n -= take_n % dp_size
+                if separate_rollout:
+                    # Each completed F/B is followed by a fresh snapshot. Drain all
+                    # scored samples; _balance_batch pads any incomplete DP group.
+                    take_n = len(ready)
+                else:
+                    take_n = min(len(ready), chunk_cap)
+                    # Only the final colocated chunk may need zero-loss padding.
+                    if len(ready) < remaining:
+                        take_n -= take_n % dp_size
                 if take_n == 0:
                     time.sleep(self.replay_buffer.poll_interval)
                     continue

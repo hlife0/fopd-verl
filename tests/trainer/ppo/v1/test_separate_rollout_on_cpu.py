@@ -118,6 +118,7 @@ def test_original_sync_keeps_hybrid_server_and_naive_transport():
 
 @pytest.mark.parametrize("field,value,match", [
     ("trainer.v1.trainer_mode", "separate_async", "trainer_mode=sync"),
+    ("trainer.v1.sync.actor_rollout_overlap_chunk_size", 3, "chunk_size=0"),
     ("trainer.v1.sync.actor_rollout_overlap", False, "requires actor_rollout_overlap"),
     ("actor_rollout_ref.rollout.n_gpus_per_node", 0, "positive dedicated"),
     ("actor_rollout_ref.rollout.tensor_model_parallel_size", 3, "divisible"),
@@ -134,21 +135,31 @@ def test_separate_rejects_role_switching_or_invalid_allocation(field, value, mat
         trainer._configure_separate_rollout()
 
 
-def _wire_pipeline(trainer, wrong_version=False):
+def _wire_pipeline(trainer, wrong_version=False, ready_counts=(1, 48)):
     events, submitted, trained = [], [], []
     published = [0]
     steps = {}
-    trainer._actor_dp_size = lambda: 1
+    trainer._actor_dp_size = lambda: trainer.config.trainer.n_gpus_per_node
     trainer._actor_update_extra_info = lambda: {"opd_no_task_reward_fast_path": True}
     trainer._apply_actor_update_metrics = lambda *args: None
     trainer._record_gen_split_timing = lambda *args: None
     trainer._dump_actor_timeline = lambda *args: None
-    trainer._balance_batch = lambda batch, **kwargs: batch
+    def balance(batch, **kwargs):
+        assert kwargs["align_to_mini_batch"] is False
+        pad = (-len(batch)) % trainer._actor_dp_size()
+        return KVBatchMeta(
+            partition_id=batch.partition_id,
+            keys=batch.keys + [f"padding_{len(trained)}_{i}" for i in range(pad)],
+            tags=batch.tags + [{"is_padding": True} for _ in range(pad)],
+            extra_info=batch.extra_info,
+        )
+
+    trainer._balance_batch = balance
 
     def submit(batch):
         assert published[0] == trainer.global_steps - 1
         submitted.extend(batch["uid"])
-        steps[trainer.global_steps] = {"uids": list(batch["uid"]), "trained": [], "last_student": None}
+        steps[trainer.global_steps] = {"uids": list(batch["uid"]), "trained": [], "last_student": None, "calls": 0}
         events.append((trainer.global_steps, "submit"))
 
     trainer._next_train_batch = lambda: {"uid": [f"s{trainer.global_steps}p{i}" for i in range(48)]}
@@ -161,7 +172,7 @@ def _wire_pipeline(trainer, wrong_version=False):
             state = steps[global_steps]
             assert prompt_uids == state["uids"]
             # Final rollout cannot complete until the early F/B has returned.
-            count = 1 if not state["trained"] else 48
+            count = ready_counts[min(state["calls"], len(ready_counts) - 1)]
             if count == 48 and state["last_student"] is None:
                 state["last_student"] = time.time()
                 events.append((global_steps, "last_student"))
@@ -184,9 +195,14 @@ def _wire_pipeline(trainer, wrong_version=False):
 
         def accumulate_actor(self, chunk):
             state = steps[trainer.global_steps]
-            assert len(chunk) == 1 and chunk.keys[0] not in trained
-            trained.extend(chunk.keys)
-            state["trained"].extend(chunk.keys)
+            real = [key for key, tag in zip(chunk.keys, chunk.tags, strict=True) if not tag.get("is_padding")]
+            assert len(chunk) % trainer._actor_dp_size() == 0
+            assert not set(real).intersection(trained)
+            expected = ready_counts[min(state["calls"], len(ready_counts) - 1)] - len(state["trained"])
+            assert len(real) == expected
+            trained.extend(real)
+            state["trained"].extend(real)
+            state["calls"] += 1
             events.append((trainer.global_steps, "fb"))
             return {"metrics": {"chunk_fb_s": 0.001}}
 
@@ -223,6 +239,7 @@ def test_two_sync_batches_train_early_once_and_publish_before_next_submit():
         metrics = {}
         trainer._step_once(metrics, {}, 48)
         trainer.on_step_end()
+        assert events.count((step, "fb")) == 2
         assert metrics["actor_rollout_overlap/samples"] == 48
         assert metrics["actor_rollout_overlap/samples_completed_before_student"] == 1
         assert events.count((step, "begin")) == events.count((step, "update")) == 1
@@ -240,3 +257,19 @@ def test_wrong_rollout_weight_version_is_rejected_before_actor_training():
     with pytest.raises(RuntimeError, match="published Actor version"):
         trainer._step_once({}, {}, 48)
     assert trained == [] and (1, "begin") not in events
+
+
+@pytest.mark.parametrize("ready_counts", [(3, 8, 48), (48,)])
+def test_separate_drains_ready_samples_and_cleans_intermediate_padding(ready_counts):
+    trainer = _trainer(actor_gpus=2)
+    events, _, trained = _wire_pipeline(trainer, ready_counts=ready_counts)
+    trainer.prepare_step()
+    with patch("verl.trainer.ppo.v1.trainer_sync.tq.kv_clear") as clear:
+        trainer._step_once({}, {}, 48)
+    assert len(trained) == len(set(trained)) == 48
+    assert events.count((1, "fb")) == len(ready_counts)
+    assert events.count((1, "update")) == 1
+    if ready_counts == (3, 8, 48):
+        clear.assert_called_once_with(partition_id="train", keys=["padding_0_0", "padding_3_0"])
+    else:
+        clear.assert_not_called()
