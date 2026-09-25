@@ -155,6 +155,7 @@ class LLMServerClient:
                 **notify_kwargs,
                 **kwargs,
             )
+            output.extra_fields["rollout_server_id"] = server_id
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
@@ -191,6 +192,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         """
         super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
         self._only_hybrid = only_hybrid
+        self.abort_retry_wait_s = 1.0
+        self.require_same_weight_version = False
+        self.expected_weight_version = None
+        self.auxiliary_server_ids = set()
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -277,12 +282,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
+        saw_segment = False
         # Prefix-cache hits are reported per prefill. The base client returns the
         # server's TokenOutput directly (so sync mode surfaces num_cached_tokens),
         # but here we rebuild a fresh TokenOutput across resume iterations, so we
         # must carry it forward explicitly or the consumer sees 0. Take the first
         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
         num_cached_tokens = None
+        first_times = {}
+        migration_count = 0
+        migrated_prefix_tokens = 0
+        aux_migrated_token_counts = []
+        earliest_fields = ("student_submit_ts", "student_first_token_ts", "engine_arrival_ts")
 
         while True:
             # 1. generate tokens
@@ -298,9 +309,16 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             )
 
             # 2. merge output into final_output
-            final_output.token_ids.extend(output.token_ids)
-            if output.log_probs is not None:
-                final_output.log_probs.extend(output.log_probs)
+            segment_tokens = list(output.token_ids)
+            segment_log_probs = output.log_probs
+            if segment_log_probs is not None and len(segment_log_probs) != len(segment_tokens):
+                raise RuntimeError(
+                    "rollout segment logprobs do not match tokens: "
+                    f"tokens={len(segment_tokens)} logprobs={len(segment_log_probs)}"
+                )
+            final_output.token_ids.extend(segment_tokens)
+            if segment_log_probs is not None:
+                final_output.log_probs.extend(segment_log_probs)
             # On partial rollout resume the model version may differ, so keep
             # existing routing and only append routing for newly generated tokens.
             if output.routed_experts is not None and len(output.token_ids) > 0:
@@ -314,14 +332,33 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
             if output.extra_fields:
+                for name in earliest_fields:
+                    value = output.extra_fields.get(name)
+                    if value is not None:
+                        first_times.setdefault(name, value)
                 final_output.extra_fields.update(output.extra_fields)
+                final_output.extra_fields.update(first_times)
 
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:
                 num_cached_tokens = output.extra_fields.get("num_cached_tokens")
 
-            # update model weights version
-            global_steps = output.extra_fields.get("global_steps", None)
+            # update model weights version. None is not "unseen"; a segment
+            # without a version is rejected when same-version continuation is on.
+            global_steps = output.extra_fields.get("global_steps", None) if output.extra_fields else None
+            saw_segment = True
+            if self.require_same_weight_version and segment_tokens and global_steps is None:
+                raise RuntimeError("rollout segment produced tokens without a weight version")
+            if self.require_same_weight_version:
+                if segment_tokens and segment_log_probs is None:
+                    raise RuntimeError("teacher-assisted segment produced tokens without logprobs")
+                if self.expected_weight_version is None:
+                    raise RuntimeError("teacher-assisted client has no expected weight version")
+                if global_steps != self.expected_weight_version:
+                    raise RuntimeError(
+                        "teacher-assisted continuation weight version mismatch: "
+                        f"expected={self.expected_weight_version}, got={global_steps}"
+                    )
             if min_global_steps is None:
                 min_global_steps = global_steps
             max_global_steps = global_steps
@@ -342,13 +379,39 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
-            await asyncio.sleep(1)
+            migration_count += 1
+            migrated_prefix_tokens = len(final_output.token_ids)
+            server_id = output.extra_fields.get("rollout_server_id") if output.extra_fields else None
+            if server_id in self.auxiliary_server_ids:
+                aux_migrated_token_counts.append(len(segment_tokens))
+            if self.abort_retry_wait_s > 0:
+                await asyncio.sleep(self.abort_retry_wait_s)
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
+        if not saw_segment:
+            raise RuntimeError("rollout generate finished without a server segment")
+        final_output.extra_fields["migration_count"] = migration_count
+        final_output.extra_fields["migrated_prefix_tokens"] = migrated_prefix_tokens
+        final_output.extra_fields["aux_migrated_token_counts"] = list(aux_migrated_token_counts)
+        final_output.extra_fields.update(first_times)
         return final_output
+
+
+class AssistedRolloutLLMServerClient(FullyAsyncLLMServerClient):
+    """Resume an aborted Student request as soon as the router has another server.
+
+    The async trainer waits a fixed second between attempts. This borrow path
+    removes the auxiliary server before aborting, so the next acquire can run
+    immediately.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.abort_retry_wait_s = 0.0
+        self.require_same_weight_version = True
 
 
 class LLMServerManager:

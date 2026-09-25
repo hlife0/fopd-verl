@@ -80,6 +80,22 @@ _GATE_BARRIER_TIMEOUT_S = 60.0
 # generate() returns. Stride limits Ray RPC volume.
 _TOKEN_NOTIFY_STRIDE = 8
 
+
+def _require_aligned_logprobs(token_ids: list[int], logprobs) -> list[float]:
+    """Return one logprob per accepted token. A missing entry is an error."""
+    if logprobs is None or len(logprobs) != len(token_ids):
+        got = None if logprobs is None else len(logprobs)
+        raise RuntimeError(
+            f"vLLM output logprobs do not cover accepted tokens: tokens={len(token_ids)} logprobs={got}"
+        )
+    values = []
+    for index, token_id in enumerate(token_ids):
+        entry = logprobs[index]
+        if entry is None or token_id not in entry:
+            raise RuntimeError(f"accepted token {token_id} at index {index} has no logprob")
+        values.append(entry[token_id].logprob)
+    return values
+
 if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
 
@@ -173,9 +189,13 @@ class vLLMHttpServer:
         # vLLM's pause stops requests being scheduled but still accepts them, and a request
         # admitted after the pause is invisible to the drain's liveness check.
         self._submission_paused = False
+        self._migration_evacuated = False
+        self._serving = True
         self._admitting = 0
         self._resume_event = asyncio.Event()
         self._resume_event.set()
+        self._serving_event = asyncio.Event()
+        self._serving_event.set()
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -672,12 +692,15 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        # No await between the final gate check and the bump: on the actor's single event loop
-        # that keeps "gate closed and _admitting == 0" from being observed mid-admission.
-        while self._submission_paused:
-            logger.debug("parking request %s until weight sync completes", request_id)
-            await self._resume_event.wait()
-        self._admitting += 1
+        if not await self._acquire_generation_admission():
+            # Router handed us this server, then it was removed. Tell the client
+            # to retry on a server that is still registered.
+            return TokenOutput(
+                token_ids=[],
+                log_probs=[],
+                stop_reason="aborted",
+                extra_fields={"global_steps": self.global_steps},
+            )
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
             generator = self.engine.generate(
@@ -688,8 +711,10 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-            # Get final response
+            # Keep the last chunk that actually carried tokens. An abort terminal
+            # often arrives with empty outputs and must not erase that prefix.
             final_res: Optional[RequestOutput] = None
+            last_nonempty: Optional[RequestOutput] = None
             admitted = False
             student_submit_ts = time.time()
             student_first_token_ts = None
@@ -698,25 +723,30 @@ class vLLMHttpServer:
                     if not admitted:
                         admitted = True
                         self._admitting -= 1
-                    if student_first_token_ts is None and output.outputs and output.outputs[0].token_ids:
+                    chunk_ids = output.outputs[0].token_ids if output.outputs else None
+                    if student_first_token_ts is None and chunk_ids:
                         student_first_token_ts = time.time()
                     if (
                         token_notify_actor is not None
                         and token_notify_key is not None
-                        and output.outputs
-                        and output.outputs[0].token_ids
+                        and chunk_ids
                     ):
-                        n_tok = len(output.outputs[0].token_ids)
+                        n_tok = len(chunk_ids)
                         if n_tok == 1 or n_tok % _TOKEN_NOTIFY_STRIDE == 0:
                             token_notify_actor.notify_student_tokens.remote(
-                                token_notify_key, list(output.outputs[0].token_ids)
+                                token_notify_key, list(chunk_ids)
                             )
+                    if chunk_ids:
+                        last_nonempty = output
                     final_res = output
             finally:
                 if not admitted:
                     self._admitting -= 1
             assert final_res is not None
             student_last_token_ts = time.time()
+            empty_terminal = not final_res.outputs or not final_res.outputs[0].token_ids
+            if empty_terminal and last_nonempty is not None:
+                final_res = last_nonempty
 
         extra_fields = {
             "global_steps": self.global_steps,
@@ -739,10 +769,8 @@ class vLLMHttpServer:
                 extra_fields["engine_prefill_s"] = first_ts - scheduled_ts
             if first_ts > 0.0 and last_ts > 0.0 and last_ts >= first_ts:
                 extra_fields["engine_decode_s"] = last_ts - first_ts
-        # Handle abort case: when the request is aborted by pause_generation(abort),
-        # outputs may be empty. Return empty results with stop_reason="aborted"
-        # instead of crashing with "IndexError: list index out of range".
-        if not final_res.outputs:
+        # A stream that never produced tokens still reports abort instead of raising.
+        if not final_res.outputs or not final_res.outputs[0].token_ids:
             return TokenOutput(
                 token_ids=[],
                 log_probs=None,
@@ -770,10 +798,10 @@ class vLLMHttpServer:
             )
             extra_fields["decode_topk_ids"] = decode_ids
             extra_fields["decode_topk_logprobs"] = decode_lps
-        token_ids = final_res.outputs[0].token_ids
+        token_ids = list(final_res.outputs[0].token_ids)
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            log_probs = _require_aligned_logprobs(token_ids, final_res.outputs[0].logprobs)
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -781,7 +809,7 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
+        if empty_terminal or finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
             stop_reason = "completed"
@@ -988,6 +1016,29 @@ class vLLMHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
+    async def _acquire_generation_admission(self) -> bool:
+        while True:
+            if self._migration_evacuated:
+                return False
+            if self._submission_paused:
+                await self._resume_event.wait()
+                continue
+            if not self._serving:
+                # Park until the caller wakes this engine. Do not enter a sleeping engine.
+                await self._serving_event.wait()
+                continue
+            # No await between the final gate check and this increment.
+            self._admitting += 1
+            return True
+
+    async def set_serving(self, serving: bool) -> None:
+        """Open or close request admission without touching engine sleep state."""
+        self._serving = bool(serving)
+        if self._serving:
+            self._serving_event.set()
+        else:
+            self._serving_event.clear()
+
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
@@ -1054,11 +1105,20 @@ class vLLMHttpServer:
             logger.exception("Error aborting requests")
             raise
 
+    async def migrate_requests(self):
+        """Stop this replica. Admissions that already hold the handle return aborted."""
+        self._migration_evacuated = True
+        report = await self.abort_all_requests(reset_prefix_cache=True)
+        self._resume_event.set()
+        self._serving_event.set()
+        return report
+
     async def resume_generation(self):
         """Resume generation after abort_all_requests (pause_generation)."""
         # Before the node_rank guard: every server in the replica closed the gate, so every
         # server must reopen it.
         self._submission_paused = False
+        self._migration_evacuated = False
         self._resume_event.set()
         if self.node_rank != 0:
             return
@@ -1465,6 +1525,13 @@ class vLLMReplica(RolloutReplica):
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+
+    async def set_serving(self, serving: bool) -> None:
+        await asyncio.gather(*[server.set_serving.remote(serving) for server in self.servers])
+
+    async def migrate_requests(self):
+        """Evacuate in-flight requests. Rank 0 owns the engine."""
+        return await self.servers[0].migrate_requests.remote()
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.

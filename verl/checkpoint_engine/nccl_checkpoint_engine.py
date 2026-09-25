@@ -189,8 +189,100 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         self.send_buf = None
         self.recv_buf = None
+        self._feed_offset = 0
+        self._feed_meta = {}
+        self._feed_op = None
 
         torch.cuda.empty_cache()
+
+    def set_bucket_size(self, bucket_size: int) -> None:
+        """Resize the aux NCCL bucket before prepare(). Does not touch the naive IPC bucket."""
+        if getattr(self, "send_buf", None) is not None:
+            raise RuntimeError("NCCL bucket size cannot change while send buffers are allocated")
+        size = int(bucket_size)
+        if size < 64 << 20:
+            raise ValueError(f"NCCL bucket must be >= 64 MiB, got {size} bytes")
+        self.bucket_size = size
+
+    def begin_feed(self) -> None:
+        """Start one fused publish. All actor ranks call this before the first weight."""
+        self._feed_offset = 0
+        self._feed_meta = {}
+        self._feed_op = None
+        self._feed_send = self.send_buf
+        self._feed_recv = self.recv_buf
+
+    async def wait_feed(self) -> None:
+        """Block until the in-flight bucket broadcast finishes, before the next FSDP gather."""
+        if getattr(self, "rank", -1) < 0:
+            return
+        op = getattr(self, "_feed_op", None)
+        if op is not None:
+            await op
+            self._feed_op = None
+
+    async def feed_weight(self, name: str, weight: torch.Tensor) -> None:
+        """Copy one gathered weight into the NCCL bucket. Rank < 0 only keeps the FSDP walk in step."""
+        if getattr(self, "rank", -1) < 0:
+            return
+        view = weight.detach().view(-1).view(torch.uint8)
+        pos = 0
+        total = weight.nbytes
+        while pos < total:
+            chunk_size = min(self.bucket_size, total - pos)
+            if self._feed_offset + chunk_size > self.bucket_size:
+                await self._flush_feed(is_last=False)
+            if self.rank == 0:
+                meta = TensorMeta(
+                    name=name,
+                    shape=weight.shape,
+                    dtype=weight.dtype,
+                    chunk_offset=pos,
+                    chunk_size=chunk_size,
+                    offset=self._feed_offset,
+                )
+                self._feed_meta[f"{name}:{pos}"] = meta
+                self._feed_send[self._feed_offset : self._feed_offset + chunk_size] = cp.asarray(
+                    view[pos : pos + chunk_size]
+                )
+            self._feed_offset += chunk_size
+            pos += chunk_size
+
+    async def finish_feed(self) -> None:
+        if getattr(self, "rank", -1) < 0:
+            return
+        await self._flush_feed(is_last=True)
+        await self.wait_feed()
+        torch.cuda.synchronize()
+
+    async def _flush_feed(self, is_last: bool) -> None:
+        # The previous bucket must finish before its buffer is reused. The launch
+        # returns while NCCL runs on this group, overlapping later gathers and IPC.
+        await self.wait_feed()
+        torch.cuda.synchronize()
+        nbytes = self._feed_offset
+        meta = self._feed_meta
+        loop = asyncio.get_running_loop()
+        if self.rank == 0:
+            op = BroadcastOperation(
+                rank=0,
+                group_name=self.group_name,
+                bucket=self._feed_send[:nbytes],
+                metadata={"bucket_meta": meta, "is_last": is_last, "length": nbytes},
+                socket=self.socket,
+                topic=self.topic,
+            )
+            self._feed_op = op.wait_for_complete()
+            self._feed_send, self._feed_recv = self._feed_recv, self._feed_send
+        else:
+            buf = self.recv_buf[:nbytes]
+
+            def _relay():
+                collective.broadcast(buf, src_rank=0, group_name=self.group_name)
+
+            self._feed_op = loop.run_in_executor(None, _relay)
+        self._feed_meta = {}
+        self._feed_offset = 0
 
     @staticmethod
     def _single_sender_ranks(actor_wg_world_size: int) -> list[int]:

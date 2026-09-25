@@ -16,6 +16,7 @@
 """TransferQueue adapter for AgentLoopManager and AgentLoopWorker"""
 
 import asyncio
+import copy
 import logging
 import os
 import time
@@ -184,6 +185,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         agent_name: str,
         **kwargs,
     ) -> AgentLoopOutput:
+        if getattr(agent_loop.server_manager, "require_same_weight_version", False):
+            expected = kwargs.get("expected_student_version")
+            if expected is None:
+                raise RuntimeError("teacher-assisted request is missing its expected Student version")
+            # Each prompt owns this copy; concurrent requests cannot overwrite
+            # another request's expected version or migration metadata.
+            client = copy.copy(agent_loop.server_manager)
+            client.expected_weight_version = int(expected)
+            auxiliary_address = kwargs.get("auxiliary_student_address")
+            client.auxiliary_server_ids = {auxiliary_address} if auxiliary_address else set()
+            agent_loop.server_manager = client
         if not self._teacher_follow_enabled(trajectory, agent_name):
             return await agent_loop.run(sampling_params, **kwargs)
 
@@ -299,6 +311,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 "engine_prefill_s": engine_prefill_s,
                 "engine_decode_s": engine_decode_s,
                 "teacher_start_ts": teacher_start_ts,
+                "migration_count": extra.get("migration_count"),
+                "migrated_prefix_tokens": extra.get("migrated_prefix_tokens"),
+                "aux_migrated_token_counts": extra.get("aux_migrated_token_counts"),
                 "teacher_done_ts": teacher_done_ts,
                 "teacher_submit_ts": extra.get("teacher_submit_ts"),
                 "teacher_first_token_ts": extra.get("teacher_first_token_ts"),

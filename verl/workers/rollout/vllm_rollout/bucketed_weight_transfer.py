@@ -89,11 +89,16 @@ class BucketedWeightSender:
         zmq_handle: str,
         bucket_size_mb: int = 512,
         use_shm: bool = False,
+        device_synchronize: bool = True,
     ):
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = bucket_size_mb
         self.bucket_size = int(bucket_size_mb) << 20
         self.use_shm = use_shm
+        # False keeps this copy on a side stream so an in-flight NCCL broadcast
+        # on the same process is not joined by the IPC handshake.
+        self.device_synchronize = device_synchronize
+        self._copy_stream = None
 
         self.zmq_context = zmq.Context.instance()
         self.socket = None
@@ -132,7 +137,7 @@ class BucketedWeightSender:
 
                 # fill the tensor bucket
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
-                    get_torch_device().synchronize()
+                    self._sync_copies()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                     self.socket.recv()
                     bucket_meta = {}
@@ -153,17 +158,26 @@ class BucketedWeightSender:
                     "offset": offset,
                     "handle": None,
                 }
-                self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
-                    weight, non_blocking=True
-                )
+                dest = self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape)
+                self._copy_weight(dest, weight)
                 offset += weight.nbytes
 
             # send the last bucket
-            get_torch_device().synchronize()
+            self._sync_copies()
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
             self.socket.recv()
         finally:
             self._cleanup()
+
+    def _copy_weight(self, dest: torch.Tensor, weight: torch.Tensor) -> None:
+        # Stay on the gather stream so this copy is ordered after the tensor exists.
+        dest.copy_(weight, non_blocking=True)
+
+    def _sync_copies(self) -> None:
+        if self.device_synchronize:
+            get_torch_device().synchronize()
+            return
+        torch.cuda.current_stream().synchronize()
 
     def _init_socket(self):
         """Initialize ZMQ REQ socket and bind."""

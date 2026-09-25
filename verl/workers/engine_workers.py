@@ -844,6 +844,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    def _iter_weights_and_aux(self, weights):
+        """One FSDP gather: naive IPC consumes the tensors, and every rank feeds the aux NCCL bucket first."""
+        engine = self.checkpoint_engine
+
+        async def _gen():
+            from verl.workers.rollout.utils import ensure_async_iterator
+
+            engine.begin_feed()
+            source = ensure_async_iterator(weights).__aiter__()
+            try:
+                name, weight = await source.__anext__()
+            except StopAsyncIteration:
+                await engine.finish_feed()
+                return
+            while True:
+                await engine.feed_weight(name, weight)
+                yield name, weight
+                # The bucket broadcast runs on its own NCCL group. Join it inside
+                # the next flush, before that buffer is reused, so the following
+                # gathers and the naive IPC overlap this broadcast.
+                try:
+                    name, weight = await source.__anext__()
+                except StopAsyncIteration:
+                    break
+            await engine.finish_feed()
+
+        return _gen()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.
@@ -871,8 +899,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                   trainer/rollout deployments.
         """
 
-        # Resolve mode: "auto" falls back to config, explicit values take precedence
-        effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+        # Resolve mode: "auto" falls back to config, explicit values take precedence.
+        # naive_aux is the main naive IPC publish plus the auxiliary NCCL feed of the same gather.
+        fuse_aux = mode == "naive_aux"
+        effective_mode = "naive" if fuse_aux else (mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend)
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
@@ -918,6 +948,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not self.peft_merge and peft_config is not None:
             self.rollout.sleep_level = 1
             do_lora_base_sync = not self.base_sync_done
+        if fuse_aux and (do_lora_base_sync or peft_config is not None):
+            raise RuntimeError("teacher-assisted fused publish does not support LoRA")
 
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
@@ -928,8 +960,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps
             )
 
+        if fuse_aux:
+            per_tensor_param = self._iter_weights_and_aux(per_tensor_param)
         await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+            per_tensor_param,
+            peft_config=peft_config,
+            base_sync_done=True,
+            global_steps=global_steps,
+            device_synchronize=not fuse_aux,
         )
 
         log_gpu_memory_usage("After update_weights", logger=logger)

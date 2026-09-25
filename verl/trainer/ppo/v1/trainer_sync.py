@@ -61,7 +61,8 @@ class PPOTrainerSync(PPOTrainer):
         self._configure_opd_no_task_reward_fast_path()
         self._configure_early_actor_lite()
         # update weights after loading checkpoint
-        self.checkpoint_manager.update_weights(self.global_steps)
+        self._publish_student_weights(self.global_steps)
+        self._published_weight_version = self.global_steps
 
     def step(self, metrics: dict, timing_raw: dict):
         batch = super().step(metrics, timing_raw)
@@ -77,6 +78,18 @@ class PPOTrainerSync(PPOTrainer):
         if self.early_actor_lite:
             metrics["early_actor_lite/enabled"] = 1
             metrics["early_actor_lite/stream_fb"] = int(getattr(self, "early_actor_stream_fb", False))
+        if getattr(self, "teacher_assisted_active", False):
+            metrics["teacher_assisted/enabled"] = 1
+            metrics.update(getattr(self, "_assisted_timings", {}))
+            step_clock = getattr(self, "_trace_step_start_ts", None)
+            prepare_start = getattr(self, "_trace_borrow_prepare_start_ts", None)
+            prepare_end = getattr(self, "_trace_borrow_prepare_end_ts", None)
+            request_submit = getattr(self, "_trace_request_submit_ts", None)
+            if step_clock is not None and prepare_start is not None and prepare_end is not None:
+                metrics["teacher_assisted/prepare_s"] = prepare_end - prepare_start
+                metrics["teacher_assisted/prepare_before_step_clock_s"] = step_clock - prepare_start
+            if step_clock is not None and request_submit is not None:
+                metrics["teacher_assisted/request_submit_offset_s"] = request_submit - step_clock
         return batch
 
     def _configure_opd_no_task_reward_fast_path(self) -> None:
@@ -401,6 +414,10 @@ class PPOTrainerSync(PPOTrainer):
             "step": self.global_steps,
             "t0": "step_start",
             "step_start_s": 0.0,
+            "clock_note": "offsets are relative to step() entry; borrow prepare is before that clock and stays inside the step wall timer",
+            "borrow_prepare_start_s": rel(getattr(self, "_trace_borrow_prepare_start_ts", None)),
+            "borrow_prepare_end_s": rel(getattr(self, "_trace_borrow_prepare_end_ts", None)),
+            "request_submit_s": rel(getattr(self, "_trace_request_submit_ts", None)),
             "student_barrier_s": rel(getattr(self, "_trace_student_barrier_ts", None)),
             "last_student_done_s": rel(last_student),
             "sleep_start_s": rel(getattr(self, "_trace_sleep_start_ts", None)),
@@ -422,12 +439,30 @@ class PPOTrainerSync(PPOTrainer):
         with open(os.path.join(out_dir, f"step_{self.global_steps}_actor_timeline.json"), "w") as fh:
             json.dump(payload, fh, indent=2)
 
+    def on_step_begin(self):
+        if not getattr(self, "teacher_assisted_active", False):
+            return
+        # Inside marked_timer("step"), before step() stamps _trace_step_start_ts.
+        self._trace_borrow_prepare_start_ts = time.time()
+        self._begin_teacher_borrow()
+        self._trace_borrow_prepare_end_ts = time.time()
+
+    def prepare_step(self) -> dict:
+        metrics = super().prepare_step()
+        if getattr(self, "teacher_assisted_active", False):
+            # First Student submit. This clock is the borrow timer, not the step() trace origin.
+            self._trace_request_submit_ts = time.time()
+            self._assisted_borrow_start = self._trace_request_submit_ts
+        return metrics
+
     def on_step_end(self):
         self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
-            self.checkpoint_manager.update_weights(self.global_steps)
+            self._publish_student_weights(self.global_steps)
         self._trace_weights_done_ts = time.time()
+        if getattr(self, "teacher_assisted_active", False):
+            self._published_weight_version = self.global_steps
 
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache

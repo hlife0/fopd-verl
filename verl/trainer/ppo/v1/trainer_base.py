@@ -246,6 +246,21 @@ class PPOTrainer(ABC):
         self.on_init_end()
 
     def _setup(self):
+        from verl.trainer.ppo.v1.teacher_assisted import resident_engines, teacher_assisted_active
+
+        self.teacher_assisted_active = teacher_assisted_active(self.config)
+        self.teacher_assisted_resident = resident_engines(self.config) if self.teacher_assisted_active else False
+        self.auxiliary_student_replica = None
+        self.auxiliary_checkpoint_manager = None
+        self.auxiliary_server_address = None
+        self._aux_in_router = False
+        self._borrow_switched = True
+        self._published_weight_version = 0
+        self._assisted_borrow_start = None
+        self._assisted_timings = {}
+        self._aux_engine_paused = False
+        if self.teacher_assisted_active:
+            self._prepare_teacher_assisted_engines()
         self._init_tokenizer()
         self._init_dataloader()
         self._init_dump_executor()
@@ -362,9 +377,13 @@ class PPOTrainer(ABC):
                 resource_pool=teacher_resource_pool,
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            if self.teacher_assisted_active:
+                self._init_auxiliary_student()
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
+            if self.teacher_assisted_active:
+                raise RuntimeError("teacher-assisted rollout requires a distillation teacher")
 
         # 9. initialize agent loop manager
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
@@ -385,11 +404,369 @@ class PPOTrainer(ABC):
         self.checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
+        if self.teacher_assisted_active:
+            self.replay_buffer.student_progress_hook = self._on_student_progress
         logger.info("all initialize finished, ready to fit")
+
+    def _prepare_teacher_assisted_engines(self) -> None:
+        """Give the actor an NCCL engine and keep both role engines sleep-capable.
+
+        The hybrid Student publish stays on the naive in-process path. Only the
+        auxiliary replica, which does not share the actor process, uses NCCL.
+        """
+        rollout = self.config.actor_rollout_ref.rollout
+        with open_dict(rollout):
+            rollout.free_cache_engine = True
+            rollout.enable_sleep_mode = True
+            rollout.checkpoint_engine.backend = "nccl"
+            # Aux workers sit on the Teacher cards, not on rank 0's NVLink peers.
+            # Relays would run NCCL on every Student GPU during the naive IPC publish.
+            nccl_kwargs = dict(rollout.checkpoint_engine.engine_kwargs.get("nccl") or {})
+            nccl_kwargs["multi_sender"] = False
+            rollout.checkpoint_engine.engine_kwargs["nccl"] = nccl_kwargs
+        teacher_models = self.config.distillation.teacher_models
+        for teacher_cfg in teacher_models.values():
+            inference = teacher_cfg.inference
+            with open_dict(inference):
+                inference.free_cache_engine = True
+                inference.enable_sleep_mode = True
+
+    def _teacher_replicas(self):
+        managers = list(self.teacher_model_manager.teacher_model_managers.values())
+        if len(managers) != 1 or len(managers[0].rollout_replicas) != 1:
+            raise RuntimeError("teacher-assisted rollout supports one Teacher TP replica")
+        return managers[0], managers[0].rollout_replicas
+
+    def _await_replica_call(self, replicas, method_name: str, *args):
+        import asyncio
+
+        from verl.utils.ray_utils import auto_await
+
+        @auto_await
+        async def _run():
+            await asyncio.gather(*[getattr(replica, method_name)(*args) for replica in replicas])
+
+        _run()
+
+    def _init_auxiliary_student(self) -> None:
+        """Place one Student replica on the Teacher pool, then put Teacher back."""
+        import asyncio
+
+        from verl.utils.ray_utils import auto_await
+        from verl.workers.config import CheckpointEngineConfig
+        from verl.workers.rollout.replica import get_rollout_replica_class
+
+        teacher_manager, teacher_replicas = self._teacher_replicas()
+        rollout_config = self.config.actor_rollout_ref.rollout
+        if rollout_config.name != "vllm":
+            raise RuntimeError("teacher-assisted rollout requires the vLLM Student engine")
+        student_world = (
+            int(rollout_config.tensor_model_parallel_size)
+            * int(rollout_config.data_parallel_size)
+            * int(rollout_config.pipeline_model_parallel_size)
+        )
+        if student_world != teacher_manager.resource_pool.world_size:
+            raise RuntimeError(
+                "auxiliary Student world size "
+                f"{student_world} must equal the Teacher pool size "
+                f"{teacher_manager.resource_pool.world_size}"
+            )
+        # Sleep Teacher only while the auxiliary engine profiles. Both stay awake after this.
+        self._await_replica_call(teacher_replicas, "set_serving", False)
+        self._await_replica_call(teacher_replicas, "sleep")
+
+        sync = self.config.trainer.v1.sync
+        from verl.trainer.ppo.v1.teacher_assisted import auxiliary_rollout_config
+
+        aux_util = float(sync.get("teacher_assisted_aux_gpu_memory_utilization", 0.2))
+        aux_bucket_mb = int(sync.get("teacher_assisted_aux_bucket_megabytes", 256))
+        aux_rollout = auxiliary_rollout_config(rollout_config, aux_util, aux_bucket_mb)
+        replica_cls = get_rollout_replica_class(rollout_config.name)
+        replica = replica_cls(
+            replica_rank=10_000,
+            config=aux_rollout,
+            model_config=self.config.actor_rollout_ref.model,
+            gpus_per_node=int(self.config.distillation.n_gpus_per_node),
+        )
+
+        @auto_await
+        async def _init():
+            await replica.init_colocated(teacher_manager.resource_pool)
+
+        aux_ready = False
+        try:
+            _init()
+            self.auxiliary_student_replica = replica
+            self._await_replica_call([replica], "set_serving", False)
+            aux_ready = True
+        except Exception:
+            logger.exception("auxiliary Student init failed")
+            raise
+        finally:
+            # Rotation sleeps aux before Teacher wakes, so 0.85 and 0.2 are not live together.
+            if aux_ready and not self.teacher_assisted_resident:
+                self._await_replica_call([replica], "sleep")
+            self._await_replica_call(teacher_replicas, "wake_up")
+            self._await_replica_call(teacher_replicas, "set_serving", True)
+
+        self.auxiliary_checkpoint_manager = CheckpointEngineManager(
+            config=CheckpointEngineConfig(backend="nccl", update_weights_bucket_megabytes=aux_bucket_mb),
+            actor_wg=self.actor_rollout_wg,
+            replicas=[replica],
+        )
+        bucket_bytes = aux_bucket_mb << 20
+        actor_n = self.actor_rollout_wg.world_size
+        ray.get(
+            self.actor_rollout_wg.execute_checkpoint_engine(
+                ["set_bucket_size"] * actor_n,
+                [bucket_bytes] * actor_n,
+            )
+        )
+        self.auxiliary_server_address = replica.server_address
+        logger.info("auxiliary Student replica initialized on the Teacher pool at %s", self.auxiliary_server_address)
+
+    def _publish_student_weights(self, global_steps: int | None = None) -> None:
+        """Publish Student weights. Assisted runs feed main IPC and aux NCCL from one gather."""
+        if (
+            not getattr(self, "teacher_assisted_active", False)
+            or not getattr(self, "teacher_assisted_resident", False)
+            or self.auxiliary_checkpoint_manager is None
+        ):
+            self.checkpoint_manager.update_weights(global_steps)
+            return
+
+        import time
+
+        from verl.checkpoint_engine.base import _worker_cls
+        from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+
+        started = time.time()
+        manager = self.auxiliary_checkpoint_manager
+        workers = []
+        for replica in manager.replicas:
+            workers.extend(replica.workers)
+        rollout = getattr(self, "_aux_publish_group", None)
+        if rollout is None:
+            rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
+            manager.build_process_group(rollout)
+            self._aux_publish_group = rollout
+        ray.get(
+            self.actor_rollout_wg.update_weights(global_steps=global_steps, mode="naive_aux")
+            + rollout.update_weights(global_steps=global_steps)
+        )
+        elapsed = time.time() - started
+        self._assisted_timings["teacher_assisted/fused_publish_s"] = elapsed
+        logger.info("fused student publish version=%s %.3fs", global_steps, elapsed)
+
+    def _begin_teacher_borrow(self) -> None:
+        """Close Teacher admission and open the already resident auxiliary replica."""
+        import time
+
+        if not self.teacher_assisted_active:
+            return
+        if not self.teacher_assisted_resident:
+            self._begin_teacher_borrow_rotation()
+            return
+        started = time.time()
+        _, teacher_replicas = self._teacher_replicas()
+        replica = self.auxiliary_student_replica
+        self._await_replica_call(teacher_replicas, "set_serving", False)
+        if self._aux_engine_paused:
+            self._await_replica_call([replica], "resume_generation")
+            self._aux_engine_paused = False
+        self._await_replica_call([replica], "set_serving", True)
+        ray.get(
+            self.llm_server_manager.global_load_balancer.add_servers.remote(
+                {self.auxiliary_server_address: replica.server_handle}
+            )
+        )
+        self._aux_in_router = True
+        self._borrow_switched = False
+        self._assisted_timings = {
+            "teacher_assisted/borrow_prepare_s": time.time() - started,
+            "teacher_assisted/teacher_sleep_s": 0.0,
+            "teacher_assisted/aux_wake_s": 0.0,
+            "teacher_assisted/aux_publish_s": 0.0,
+            "teacher_assisted/weight_version": self._published_weight_version,
+            "teacher_assisted/resident": 1,
+        }
+        logger.info(
+            "teacher borrow started, version=%s prepare=%.3fs",
+            self._published_weight_version,
+            self._assisted_timings["teacher_assisted/borrow_prepare_s"],
+        )
+
+    def _begin_teacher_borrow_rotation(self) -> None:
+        """Level-1: sleep Teacher, wake the auxiliary Student, publish, then admit requests."""
+        import time
+
+        started = time.time()
+        _, teacher_replicas = self._teacher_replicas()
+        replica = self.auxiliary_student_replica
+        sleep_started = time.time()
+        self._await_replica_call(teacher_replicas, "set_serving", False)
+        self._await_replica_call(teacher_replicas, "sleep")
+        teacher_sleep_s = time.time() - sleep_started
+        wake_started = time.time()
+        self._await_replica_call([replica], "wake_up")
+        aux_wake_s = time.time() - wake_started
+        publish_started = time.time()
+        self.auxiliary_checkpoint_manager.update_weights(self._published_weight_version)
+        aux_publish_s = time.time() - publish_started
+        self._aux_engine_paused = False
+        self._await_replica_call([replica], "set_serving", True)
+        ray.get(
+            self.llm_server_manager.global_load_balancer.add_servers.remote(
+                {self.auxiliary_server_address: replica.server_handle}
+            )
+        )
+        self._aux_in_router = True
+        self._borrow_switched = False
+        self._assisted_timings = {
+            "teacher_assisted/borrow_prepare_s": time.time() - started,
+            "teacher_assisted/teacher_sleep_s": teacher_sleep_s,
+            "teacher_assisted/aux_wake_s": aux_wake_s,
+            "teacher_assisted/aux_publish_s": aux_publish_s,
+            "teacher_assisted/weight_version": self._published_weight_version,
+            "teacher_assisted/resident": 0,
+        }
+        logger.info(
+            "teacher borrow rotation version=%s sleep=%.3fs wake=%.3fs publish=%.3fs",
+            self._published_weight_version,
+            teacher_sleep_s,
+            aux_wake_s,
+            aux_publish_s,
+        )
+
+    def _switch_teacher_back(self, n_complete: int) -> None:
+        """Remove the auxiliary replica, migrate its requests, and wake Teacher."""
+        import time
+
+        from verl.trainer.ppo.v1.teacher_assisted import (
+            assign_migrations,
+            completion_threshold,
+            migration_fits,
+            should_switch,
+            teacher_assisted_settings,
+        )
+
+        if self._borrow_switched:
+            return
+        ratio, borrow_s = teacher_assisted_settings(self.config)
+        elapsed = 0.0 if self._assisted_borrow_start is None else time.time() - self._assisted_borrow_start
+        sync_step = int(self.parameter_sync_step)
+        total = (int(self.config.data.train_batch_size) // sync_step) * int(self.config.actor_rollout_ref.rollout.n)
+        threshold = completion_threshold(ratio, total)
+        reason = should_switch(
+            n_complete,
+            threshold,
+            elapsed,
+            borrow_s,
+            all_done=n_complete >= total,
+        )
+        if reason is None:
+            return
+
+        started = time.time()
+        balancer = self.llm_server_manager.global_load_balancer
+        status = ray.get(balancer.get_status.remote())
+        loads = {
+            server_id: int(count)
+            for server_id, count in status["servers"].items()
+            if server_id != self.auxiliary_server_address
+        }
+        aux_inflight = int(status["servers"].get(self.auxiliary_server_address, 0))
+        max_num_seqs = int(self.config.actor_rollout_ref.rollout.max_num_seqs)
+        if not migration_fits(aux_inflight, loads, max_num_seqs):
+            spread = assign_migrations(aux_inflight, loads)
+            raise RuntimeError(
+                "teacher-assisted migration exceeds Student max_num_seqs "
+                f"({max_num_seqs}); inflight={aux_inflight}, spread={spread}"
+            )
+        ray.get(balancer.remove_servers.remote([self.auxiliary_server_address]))
+        self._aux_in_router = False
+        migrate_started = time.time()
+        report = self._await_replica_call_value(self.auxiliary_student_replica, "migrate_requests")
+        migrate_s = time.time() - migrate_started
+        self._await_replica_call([self.auxiliary_student_replica], "set_serving", False)
+        _, teacher_replicas = self._teacher_replicas()
+        if self.teacher_assisted_resident:
+            self._aux_engine_paused = True
+            self._await_replica_call(teacher_replicas, "set_serving", True)
+            aux_sleep_s = 0.0
+            teacher_wake_s = 0.0
+        else:
+            self._aux_engine_paused = False
+            sleep_started = time.time()
+            self._await_replica_call([self.auxiliary_student_replica], "sleep")
+            aux_sleep_s = time.time() - sleep_started
+            wake_started = time.time()
+            self._await_replica_call(teacher_replicas, "wake_up")
+            self._await_replica_call(teacher_replicas, "set_serving", True)
+            teacher_wake_s = time.time() - wake_started
+        self._borrow_switched = True
+        aborted = 0 if not isinstance(report, dict) else int(report.get("aborted_count", 0))
+        reason_code = {"complete_count": 1, "max_borrow_time": 2, "all_students_done": 3}.get(reason, 0)
+        ready_offset = 0.0 if self._assisted_borrow_start is None else time.time() - self._assisted_borrow_start
+        self._assisted_timings.update(
+            {
+                "teacher_assisted/switched": 1,
+                "teacher_assisted/switch_s": time.time() - started,
+                "teacher_assisted/migrate_s": migrate_s,
+                "teacher_assisted/aux_sleep_s": aux_sleep_s,
+                "teacher_assisted/teacher_wake_s": teacher_wake_s,
+                "teacher_assisted/migrated_requests": aborted,
+                "teacher_assisted/complete_at_switch": n_complete,
+                "teacher_assisted/complete_ratio_at_switch": (n_complete / total) if total else 0.0,
+                "teacher_assisted/complete_threshold": -1 if threshold is None else threshold,
+                "teacher_assisted/complete_overshoot": 0 if threshold is None else n_complete - threshold,
+                "teacher_assisted/switch_reason_code": reason_code,
+                "teacher_assisted/borrow_elapsed_s": elapsed,
+                "teacher_assisted/teacher_ready_offset_s": ready_offset,
+                "teacher_assisted/resident": 1 if self.teacher_assisted_resident else 0,
+            }
+        )
+        logger.info(
+            "teacher borrow ended reason=%s complete=%s migrated=%s switch=%.3fs",
+            reason,
+            n_complete,
+            aborted,
+            self._assisted_timings["teacher_assisted/switch_s"],
+        )
+
+    def _await_replica_call_value(self, replica, method_name: str):
+        import asyncio
+
+        from verl.utils.ray_utils import auto_await
+
+        @auto_await
+        async def _run():
+            return await getattr(replica, method_name)()
+
+        return _run()
+
+    def _on_student_progress(self, n_complete: int) -> None:
+        if not self.teacher_assisted_active or self._borrow_switched or self._assisted_borrow_start is None:
+            return
+        try:
+            self._switch_teacher_back(n_complete)
+        except Exception:
+            logger.exception("teacher-assisted switch failed at %s complete trajectories", n_complete)
+            raise
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
-        return self.llm_server_manager.get_client()
+        cached = getattr(self, "_rollout_llm_client", None)
+        if cached is not None:
+            return cached
+        if getattr(self, "teacher_assisted_active", False):
+            from verl.workers.rollout.llm_server import AssistedRolloutLLMServerClient
+
+            client = self.llm_server_manager.get_client(client_cls=AssistedRolloutLLMServerClient)
+        else:
+            client = self.llm_server_manager.get_client()
+        self._rollout_llm_client = client
+        return client
 
     def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
         """Get the On-Policy Distillation teacher server clients.
@@ -648,6 +1025,16 @@ class PPOTrainer(ABC):
                     "index": i,
                     "prompt_len": tag.get("prompt_len"),
                     "response_len": tag.get("response_len"),
+                    **{
+                        key: tag.get(key)
+                        for key in (
+                            "migration_count",
+                            "migrated_prefix_tokens",
+                            "aux_migrated_token_counts",
+                            "min_global_steps",
+                            "max_global_steps",
+                        )
+                    },
                     "student_submit_ts": tag.get("student_submit_ts"),
                     "student_first_token_ts": tag.get("student_first_token_ts"),
                     "student_last_token_ts": tag.get("student_last_token_ts"),
@@ -1536,6 +1923,11 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        if getattr(self, "teacher_assisted_active", False):
+            # The client inside each Ray worker is a serialized copy. Send the
+            # version with this batch instead of mutating the driver's client.
+            batch["expected_student_version"] = NonTensorData(self._published_weight_version)
+            batch["auxiliary_student_address"] = NonTensorData(self.auxiliary_server_address)
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(

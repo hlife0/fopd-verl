@@ -203,7 +203,13 @@ class ReplayBuffer:
         for partition_id, items in data.items():
             partition = self.partitions[partition_id]
             for key, tag in items.items():
+                # A put can reserve the key before status/tags are published.
+                # Skip that snapshot; the next poll sees the completed record.
+                if not isinstance(tag, dict) or not tag:
+                    continue
                 if tag.get("is_prompt", False):
+                    if "status" not in tag or "global_steps" not in tag:
+                        continue
                     # see: [GRPO group sampling control]
                     self.prompt_global_steps[partition_id][key] = tag["global_steps"]
                     match tag["status"]:
@@ -432,6 +438,7 @@ class ReplayBuffer:
         while True:
             self._sync_metadata_from_transfer_queue()
             ready = self._student_ready_prompt_uids(partition_id, sessions_per_prompt)
+            self._notify_student_progress(partition_id)
             if len(ready) >= batch_size:
                 return ready
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
@@ -479,6 +486,21 @@ class ReplayBuffer:
             keys.append(key)
             tags.append(tag)
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+
+    def count_complete_student_trajectories(self, partition_id: str) -> int:
+        """Complete logical Student trajectories. Partial migrations are not counted."""
+        self._sync_metadata_from_transfer_queue()
+        return sum(
+            1
+            for tag in self.partitions[partition_id].values()
+            if tag.get("student_gen_done_ts") is not None and not tag.get("is_padding", False)
+        )
+
+    def _notify_student_progress(self, partition_id: str) -> None:
+        hook = getattr(self, "student_progress_hook", None)
+        if hook is None or partition_id != "train":
+            return
+        hook(self.count_complete_student_trajectories(partition_id))
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
         time.sleep(self.poll_interval)
@@ -647,6 +669,7 @@ class ReplayBufferAsync(ReplayBuffer):
         while True:
             # Eviction and selection share one snapshot so newly terminal stale groups wait for the next eviction pass.
             self._sync_metadata_from_transfer_queue()
+            self._notify_student_progress(partition_id)
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             evicted_uids, stale_count, _dapo_count, metrics = self._evict_terminal_groups(

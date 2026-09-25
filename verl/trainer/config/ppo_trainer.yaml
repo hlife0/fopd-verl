@@ -243,6 +243,23 @@ trainer:
       # Without the fast path, leftover Teacher overlaps old_log_prob instead.
       early_actor_lite: false
 
+      # Borrow the Teacher GPUs for one extra Student replica, then switch back.
+      # False, or max_borrow_s <= 0, keeps the original sd-early path and does not
+      # create that replica.
+      teacher_assisted_rollout: false
+      # Fraction of this step's Student trajectories. null switches only on the
+      # time limit or when every Student trajectory is already complete.
+      teacher_assisted_complete_ratio: null
+      # Seconds from the first Student submit. <= 0 disables the feature.
+      teacher_assisted_max_borrow_s: 0
+      # null: resident when Teacher util + aux util fits on one card, otherwise level-1 sleep/wake.
+      # false forces sleep/wake. true cannot override a pair that does not fit.
+      teacher_assisted_resident: null
+      # Auxiliary Student only. Teacher inference gpu_memory_utilization is unchanged.
+      teacher_assisted_aux_gpu_memory_utilization: 0.2
+      # NCCL bucket for the auxiliary replica. The main naive publish keeps its own bucket.
+      teacher_assisted_aux_bucket_megabytes: 256
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

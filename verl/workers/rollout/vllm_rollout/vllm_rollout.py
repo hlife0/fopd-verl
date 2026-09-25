@@ -225,6 +225,7 @@ class ServerAdapter(BaseRollout):
             f"vLLM rollout supports wire_format='named_tensors' or 'delta_flush'; got {wire_format!r}"
         )
         start_time = time.time()
+        device_synchronize = kwargs.pop("device_synchronize", True)
 
         future = await self._execute_method(
             "update_weights_from_ipc",
@@ -237,6 +238,7 @@ class ServerAdapter(BaseRollout):
             zmq_handle=self.zmq_handle,
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
+            device_synchronize=device_synchronize,
         )
         await sender.async_send_weights(weights)
 
