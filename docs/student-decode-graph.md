@@ -19,4 +19,28 @@ Student `calculate_log_probs=True`，每个生成 token 要一个被选 logprob�
 
 两次 16 条、每条 128 token 的 id 完全相同。采样、rejection method、k 都没改。只多覆盖 draft decode 的 FULL 图。
 
-这是高并发窗口。还没有四卡整步数字。正式计时用 `scripts/student_decode_graph_4gpu.sh`，对照仍是 `20260926-sd-early-followoff-052727`，不要重跑那份。profile 和正式计时分开。
+这是高并发窗口，不是训练的 2048。profile 和正式计时分开。
+
+## 四卡单次
+
+`runs/4gpu-0.6b-from-8b/student-decode-graph-20260926_055951`。`train_exit=0`，`teacher_follow=False`。Hydra 打印 `cudagraph_mode=FULL_AND_PIECEWISE`。三个 Student 服务有 `Capturing decode CUDA graphs (FULL)`（4/4），prefill 同时有 PIECEWISE 和 FULL。另一进程 `2018527` 是 enforce eager，关掉了 CUDA graph，decode 图不是它抓的。没有写入 `052727`。k 仍是 3。
+
+对照是已有的 `20260926-sd-early-followoff-052727`，没有重跑。口径：整步 / Student / Teacher 尾 / Actor-after-T / 发布 / response token。Actor-after-T 是样本 `actor_done_ts` 减最晚 `teacher_done_ts`。token 是 48 条 `response_len` 之和。
+
+| | 整步 | Student | Teacher尾 | Actor-after-T | 发布 | resp |
+|---|---:|---:|---:|---:|---:|---:|
+| 本组 3–5 | 25.816 | 16.465 | 5.432 | 1.201 | 2.647 | 55547 |
+| 052727 3–5 | 28.908 | 19.709 | 5.454 | 0.997 | 2.689 | 54902.67 |
+| 本组减 052727 | -3.092 | -3.244 | -0.022 | +0.204 | -0.042 | +644 |
+
+| step | 整步 | Student | Teacher尾 | Actor-after-T | 发布 | resp | 顶到 2048 | loss | grad |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 38.104 | 17.739 | 1.569 | 2.901 | 2.828 | 50326 | 7 | 0.292 | 12.691 |
+| 2 | 22.144 | 16.020 | 1.634 | 1.635 | 2.783 | 46719 | 5 | 0.296 | 11.718 |
+| 3 | 23.668 | 15.634 | 4.290 | 1.041 | 2.633 | 49644 | 11 | 0.144 | 12.480 |
+| 4 | 25.253 | 15.820 | 5.653 | 1.061 | 2.646 | 54250 | 12 | 0.136 | 11.580 |
+| 5 | 28.525 | 17.941 | 6.353 | 1.499 | 2.662 | 62747 | 17 | 0.090 | 10.474 |
+
+每步 48 条，`aborted_ratio=0`，loss 和 grad 有限。五步 Student 都低于 052727 的 21.218 / 19.121 / 19.723 / 19.617 / 19.787。step 5 整步是 28.525，高于 052727 的 28.042；这一步 17 条顶到 2048（052727 是 12 条），response 62747 对 55006，Teacher 尾 6.353 对 4.431。后 3 步 response/Student 秒大约是 3175、3429、3497，052727 是 2673、2905、2780。采样轨迹不同，loss 不能当逐 token 核对。
+
+单次运行。不写成稳定加速。接下来用同一工作区交错两对：`scripts/student_decode_piecewise_4gpu.sh` 与 `scripts/student_decode_graph_4gpu.sh`，顺序是 PIECEWISE、FULL、PIECEWISE、FULL。两边只差 `cudagraph_mode`。不重跑 `052727`，也不把 profiler 开在计时上。
