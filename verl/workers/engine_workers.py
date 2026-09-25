@@ -925,6 +925,71 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         import_unit(self.actor.engine.module, unit, values, gradients=gradients)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_migration_units(self, units: list, gradients: bool = False):
+        from verl.workers.engine.fsdp.migration import export_units
+        return export_units(self.actor.engine.module, units, gradients=gradients)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def import_migration_units(self, units: list, values: dict, gradients: bool = False):
+        from verl.workers.engine.fsdp.migration import import_units
+        import_units(self.actor.engine.module, units, values, gradients=gradients)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def init_gradient_exchange(self, master_addr: str, master_port: int, src_rank: int, is_early: bool):
+        from datetime import timedelta
+        from torch.distributed import TCPStore
+        local = torch.distributed.get_rank()
+        self._grad_exchange_src = src_rank
+        self._grad_store = None
+        # The early publisher and the colocated main rank share one GPU, so they
+        # cannot be two ranks of one NCCL group. They only share a store.
+        joins = (is_early and local == 0) or ((not is_early) and local == src_rank)
+        if not joins:
+            return
+        self._grad_store = TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=2,
+            is_master=not is_early,
+            timeout=timedelta(seconds=300),
+            use_libuv=False,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def send_migration_parameters(self, units):
+        from verl.workers.engine.fsdp.migration import publish_parameters
+        publish_parameters(self.actor.engine.module, tuple(units), self._grad_store, self._grad_exchange_src)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def recv_migration_parameters(self, units):
+        from verl.workers.engine.fsdp.migration import consume_parameters
+        consume_parameters(self.actor.engine.module, tuple(units), self._grad_store)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def materialize_migration_grads(self):
+        module = self.actor.engine.module
+        handles = getattr(module, "_all_handles", None)
+        if handles:
+            for handle in handles:
+                flat = handle.flat_param
+                if flat.requires_grad and flat.grad is None:
+                    flat.grad = torch.zeros_like(flat)
+            return
+        for parameter in module.parameters():
+            if parameter.requires_grad and parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def send_migration_gradients(self, units):
+        from verl.workers.engine.fsdp.migration import publish_gradients
+        publish_gradients(self.actor.engine.module, tuple(units), self._grad_store)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def recv_migration_gradients(self, units):
+        from verl.workers.engine.fsdp.migration import consume_gradients
+        consume_gradients(self.actor.engine.module, tuple(units), self._grad_store, self._grad_exchange_src)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def migration_loss_state(self):
         tokens = self.actor._held_loss_tokens.clone()
         torch.distributed.all_reduce(tokens, group=self.actor.engine.get_data_parallel_group())

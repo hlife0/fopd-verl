@@ -93,13 +93,22 @@ def _wire(monkeypatch, failure=None):
         def migration_loss_state(self):
             assert len(early) == 2
             return [{"tokens": 7., "outputs": []}]
-        def export_migration_unit(self, unit, gradients):
-            assert gradients
-            calls.append("export_grad")
-            return [{"p": 1}]
-        def import_migration_unit(self, unit, values, gradients):
-            assert main and gradients
-            calls.append("import_grad")
+        def send_migration_parameters(self, units):
+            calls.append("send_weights")
+            return ["send_weights"]
+        def recv_migration_parameters(self, units):
+            calls.append("recv_weights")
+            return ["recv_weights"]
+        def materialize_migration_grads(self):
+            calls.append("materialize")
+        def send_migration_gradients(self, units):
+            assert tuple(units) == ("root", "layer")
+            calls.append("send_migration_gradients")
+            return ["send"]
+        def recv_migration_gradients(self, units):
+            assert tuple(units) == ("root", "layer")
+            calls.append("recv_migration_gradients")
+            return ["recv"]
         def add_migration_loss_state(self, state):
             assert state["tokens"] == 7
             calls.append("add_tokens")
@@ -118,9 +127,11 @@ def test_migration_orders_abort_early_fb_main_fb_merge_and_single_update(monkeyp
     trainer, calls, early, main, cleared = _wire(monkeypatch)
     metrics = {}
     trainer._step_once(metrics, {}, 9)
-    assert calls.index("remove") < calls.index("migrate") < calls.index("sleep") < calls.index("early:fb")
-    assert calls.index("main:begin") < calls.index("main:fb") < calls.index("import_grad")
-    assert calls.index("import_grad") < calls.index("early:abort") < calls.index("finish")
+    assert calls.index("remove") < calls.index("migrate") < calls.index("sleep") < calls.index("send_weights")
+    assert calls.index("send_weights") < calls.index("early:fb")
+    assert calls.index("main:fb") < calls.index("recv_migration_gradients") < calls.index("early:abort")
+    assert calls.index("early:abort") < calls.index("finish")
+    assert "to" not in calls
     assert calls.count("finish") == calls.count("add_tokens") == 1
     assert len(early) == 2 and len(main) == 7 and cleared == ["pad0", "pad1"]
     assert metrics["actor_rollout_migrate/early_loss_tokens"] == 7
@@ -153,20 +164,11 @@ def test_migration_rejects_grad_scaler_before_allocating_workers(dtype):
         trainer._setup()
 
 
-def test_parameter_sync_uses_worker_device_api_and_releases_early_weights():
-    from omegaconf import OmegaConf
-    trainer = _trainer()
-    OmegaConf.update(trainer.config, "actor_rollout_ref.actor.fsdp_config.param_offload", False, force_add=True)
-    moves = []
-    class Group:
-        def to(self, device, **kwargs):
-            assert device in ("cpu", "device")
-            moves.append(device)
-        def export_migration_unit(self, unit):
-            return [{"weight": 1}]
-        def import_migration_unit(self, unit, values):
-            assert values == {"weight": 1}
-    trainer.migration_actor_wg = trainer.actor_rollout_wg = Group()
-    trainer._migration_units = ["root"]
-    trainer._sync_migration_weights()
-    assert moves == ["device", "cpu"]
+def test_parameter_sync_stays_off_the_step_start_path(monkeypatch):
+    trainer, _, _, _, _ = _wire(monkeypatch)
+    called = []
+    trainer._sync_migration_weights = lambda: called.append("sync")
+    trainer._next_train_batch = lambda: {"uid": [1]}
+    trainer._submit_batch_to_rollout = lambda batch: None
+    trainer.prepare_step()
+    assert called == []

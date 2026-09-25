@@ -16,6 +16,7 @@ import logging
 import math
 from copy import deepcopy
 import os
+import socket
 import time
 
 import transfer_queue as tq
@@ -249,23 +250,38 @@ class PPOTrainerSync(PPOTrainer):
         self._migration_units = self.actor_rollout_wg.migration_units()[0]
         if self.migration_actor_wg.migration_units()[0] != self._migration_units:
             raise ValueError("Main and early FSDP wrapping must use identical parameter units")
+        self._init_gradient_exchange()
+
+    def _init_gradient_exchange(self):
+        # Separate Ray groups already own process groups. A stateless NCCL
+        # communicator lets the early full gradient land in the main shards
+        # without a host copy through the driver.
+        main = self.actor_rollout_wg.world_size
+        early = self.migration_actor_wg.world_size
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        # Early ranks occupy the last early GPUs. Rank 0 of that group shares
+        # its GPU with this main rank.
+        src = main - early
+        addr = "127.0.0.1"
+        main_refs = self.actor_rollout_wg.init_gradient_exchange(addr, port, src, False)
+        early_refs = self.migration_actor_wg.init_gradient_exchange(addr, port, src, True)
+        ray.get([*main_refs, *early_refs])
+
+    def _merge_migration_gradients(self):
+        units = tuple(self._migration_units)
+        early_refs = self.migration_actor_wg.send_migration_gradients(units)
+        main_refs = self.actor_rollout_wg.recv_migration_gradients(units)
+        ray.get([*early_refs, *main_refs])
 
     def _sync_migration_weights(self):
-        # One FSDP unit at a time bounds host/transport copies. This cost belongs
-        # to the step's prepare phase; no uncounted background parameter copies.
-        self.migration_actor_wg.to("device", optimizer=False, grad=False)
-        main_offload = self.config.actor_rollout_ref.actor.fsdp_config.param_offload
-        if main_offload:
-            self.actor_rollout_wg.to("device", optimizer=False, grad=False)
-        try:
-            for unit in self._migration_units:
-                values = _first_output(self.actor_rollout_wg.export_migration_unit(unit))
-                self.migration_actor_wg.import_migration_unit(unit, values)
-                del values
-        finally:
-            self.migration_actor_wg.to("cpu", optimizer=False, grad=False)
-            if main_offload:
-                self.actor_rollout_wg.to("cpu", optimizer=False, grad=False)
+        # Called only after the migrated replica has slept. The other Student
+        # cards are still decoding; this copy is not on the step-start path.
+        units = tuple(self._migration_units)
+        main_refs = self.actor_rollout_wg.send_migration_parameters(units)
+        early_refs = self.migration_actor_wg.recv_migration_parameters(units)
+        ray.get([*main_refs, *early_refs])
 
     def _migrate_and_train(self, metrics, timing_raw, sample_batch_size):
         from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
@@ -304,6 +320,9 @@ class PPOTrainerSync(PPOTrainer):
                     timing_raw["migration"] = time.time() - migrate_start
                     self._migration_start_ts = migrate_start
                     self._migration_done_ts = time.time()
+                    weight_sync_start = time.time()
+                    self._sync_migration_weights()
+                    timing_raw["migration_weight_sync"] = time.time() - weight_sync_start
                 if all_students and not asleep:
                     self._trace_student_barrier_ts = time.time()
                     self._trace_sleep_start_ts = time.time()
@@ -314,11 +333,12 @@ class PPOTrainerSync(PPOTrainer):
                     self._trace_sleep_end_ts = time.time()
                     asleep = True
                     timing_raw["gen"] = time.time() - gen_start
-                    if early_started:
+                    if early_started and early_state is None:
                         early_state = self.migration_actor_wg.migration_loss_state()[0]
                         early_tokens = early_state["tokens"]
-                    main_started = True
-                    self.actor_rollout_wg.begin_actor_accumulate(loss_normalization_tokens=denominator)
+                    if not main_started:
+                        main_started = True
+                        self.actor_rollout_wg.begin_actor_accumulate(loss_normalization_tokens=denominator)
                     if self._trace_actor_start_ts is None:
                         self._trace_actor_start_ts = time.time()
                 available = [key for key in ready if key not in consumed]
@@ -363,13 +383,8 @@ class PPOTrainerSync(PPOTrainer):
                                "return_ts": time.time(), "chunk_fb_s": _chunk_fb_s(result)})
                 consumed.update(take)
                 if phase == "main" and early_started:
-                    # The first main chunk allocated gradient storage. Merge now
-                    # and release the early model before the remaining main F/B.
                     merge_start = time.time()
-                    for unit in self._migration_units:
-                        values = _first_output(self.migration_actor_wg.export_migration_unit(unit, gradients=True))
-                        self.actor_rollout_wg.import_migration_unit(unit, values, gradients=True)
-                        del values
+                    self._merge_migration_gradients()
                     self.actor_rollout_wg.add_migration_loss_state(early_state)
                     self.migration_actor_wg.abort_actor_accumulate()
                     early_started = False
@@ -415,8 +430,6 @@ class PPOTrainerSync(PPOTrainer):
     def prepare_step(self) -> dict:
         if not (getattr(self, "actor_rollout_overlap", False) or getattr(self, "actor_rollout_migrate", False)):
             return super().prepare_step()
-        if getattr(self, "actor_rollout_migrate", False):
-            self._sync_migration_weights()
         batch = self._next_train_batch()
         # Capture the actual submitted IDs, rather than selecting any ready groups
         # left in the queue (which can belong to another logical batch).
