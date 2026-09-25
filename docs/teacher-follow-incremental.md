@@ -57,6 +57,10 @@
 
 step 3 和 5 的收尾未命中是更长的序列（payload 平均约 1437 和 1460，命中的约 1124 和 1030）。这两步中途的 cached/payload 也掉到 285.6/513.1 和 232.6/472.0，不是只有最后一条没中。Teacher 尾变成 8.059 和 10.102 秒，长于已公布基线的 4.315 秒。
 
-后 3 步相对已公布表：整步 30.661（+4.466）、Student 20.082（+0.710）、Teacher 尾 6.088（+1.773）、Actor-after-Teacher 1.774（+0.646）、发布 2.645（+1.331）、response tokens 54279.67（+1692.67）。对照不是新的同期 baseline，这组又更慢，所以不把它写成加速。发布变长没有从 cache 表里得到解释。
+正式对照是 `runs/4gpu-0.6b-from-8b/20260926-sd-early-followoff-052727`，源码 `.worktrees/sd-early-reference`（与 `baseline/sd-early` 同一提交），`teacher_follow=False`，`train_exit=0`。没有 `follow_cache.jsonl` / `teacher_requests.jsonl`。公共四卡入口，`TEACHER_FOLLOW=False`。`scripts/teacher_follow_incremental_4gpu.sh` 把 follow 写死为 True，没有拿来跑这组对照。`035937` 只作历史参考。
 
-接口能复用，这一批评分里也复用了；并发时长序列会把 cache 挤掉，收尾重算把 Teacher 尾拉长，命中时整步又被露出来的 Actor 抵消。这条支线停在这里。
+后 3 步：follow 30.661 / 20.082 / 6.088 / 1.774 / 2.645 / 54279.67，本次对照 28.908 / 19.709 / 5.454 / 0.997 / 2.689 / 54902.67。follow 减对照：整步 +1.753、Student +0.373、Teacher 尾 +0.634、Actor-after-Teacher +0.777、发布 -0.044、response tokens -623。两边发布都在 2.6–2.7 秒，本次对照也没有回到 035937 的 1.314 秒，发布差不记在 follow 上。两边 `response/aborted_ratio=0`，loss 和 grad 有限。单次运行，整步更长。
+
+非收尾 `new_tokens` 都是 16 的倍数，收尾 `payload_len` 都等于当时 `seq_len`。step 1、2、4 每条约 27 / 26 / 23 次请求，非收尾 new_tokens 中位数 16，Teacher 尾 0.128 / 0.061 / 0.104 秒，蒸馏 loss 0.559 / 0.567 / 0.529。step 3、5 每条约 9.1 / 8.7 次请求，中位数 112，收尾 `num_cached==0` 为 17/48 和 23/48，Teacher 尾 8.059 和 10.102 秒，loss 0.112 和 0.090，落在本次对照的逐步 loss 范围内。`num_cached==0` 只表示没有复用 KV。两组 response 长度不同，loss 差不是逐 token 对齐过的语义对照。
+
+不扫 block 或其他参数。这条候选停在这里。
