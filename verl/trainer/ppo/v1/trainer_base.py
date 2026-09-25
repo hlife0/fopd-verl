@@ -43,6 +43,7 @@ from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.experimental.teacher_loop.teacher_follow import TEACHER_FOLLOW_TRACE_KEYS
 from verl.protocol import DataProto, DataProtoFuture
+from verl.utils.mps import role_mps_env
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
     RayWorkerGroup,
@@ -309,10 +310,12 @@ class PPOTrainer(ABC):
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             if not class_dict:
                 continue
+            role_env = role_mps_env("actor") if str(actor_role) in class_dict else {}
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = RayWorkerGroup(
                 resource_pool=resource_pool,
                 ray_cls_with_init=worker_dict_cls,
+                worker_env=role_env,
                 **wg_kwargs,
             )
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())

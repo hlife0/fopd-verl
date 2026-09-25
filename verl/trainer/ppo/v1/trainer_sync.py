@@ -13,6 +13,7 @@
 # limitations under the License.
 import json
 import logging
+import math
 import os
 import time
 
@@ -175,8 +176,14 @@ class PPOTrainerSync(PPOTrainer):
             raise ValueError("actor_rollout_overlap requires critic_warmup=0")
         if int(self.config.data.max_response_length) <= 0:
             raise ValueError("actor_rollout_overlap requires a positive max_response_length")
-        if int(sync_config.get("actor_rollout_overlap_chunk_size", 0)) < 0:
-            raise ValueError("actor_rollout_overlap_chunk_size must be nonnegative")
+        if int(sync_config.get("actor_rollout_overlap_chunk_size", 0)) != 0:
+            raise ValueError("actor_rollout_overlap_chunk_size must be 0: overlap drains all ready samples")
+        for name, default in (
+            ("actor_rollout_overlap_teacher_fraction", 0.5),
+            ("actor_rollout_overlap_student_fraction", 0.75),
+        ):
+            if not 0 < float(sync_config.get(name, default)) <= 1:
+                raise ValueError(f"{name} must be in (0, 1]")
         logger.info("actor_rollout_overlap: accumulate scored trajectories before the Student barrier")
 
     def prepare_step(self) -> dict:
@@ -284,10 +291,13 @@ class PPOTrainerSync(PPOTrainer):
         prompt_uids = self._actor_overlap_prompt_uids
         if len(prompt_uids) != sample_batch_size:
             raise RuntimeError("actor_rollout_overlap submitted prompt count differs from the logical batch")
-        dp_size = self._actor_dp_size()
-        chunk_cap = int(self.config.trainer.v1.sync.get("actor_rollout_overlap_chunk_size", 0)) or dp_size
-        if chunk_cap < dp_size or chunk_cap % dp_size:
-            raise ValueError("actor_rollout_overlap_chunk_size must be a positive multiple of Actor DP size")
+        sync_config = self.config.trainer.v1.sync
+        teacher_threshold = math.ceil(
+            sample_batch_size * float(sync_config.get("actor_rollout_overlap_teacher_fraction", 0.5))
+        )
+        student_threshold = math.ceil(
+            sample_batch_size * float(sync_config.get("actor_rollout_overlap_student_fraction", 0.75))
+        )
         denominator = sample_batch_size * int(self.config.data.max_response_length)
         consumed: set[str] = set()
         chunks: list[dict] = []
@@ -314,14 +324,17 @@ class PPOTrainerSync(PPOTrainer):
                     students_asleep = True
                 ready = [key for key in teacher_ready if key not in consumed]
                 remaining = sample_batch_size - len(consumed)
-                take_n = min(len(ready), chunk_cap)
-                # Only the final chunk may need synthetic zero-loss padding.
-                if len(ready) < remaining:
-                    take_n -= take_n % dp_size
-                if take_n == 0:
+                # Gate only the first F/B. Once started, drain every new ready
+                # trajectory after each completed call, including non-DP-sized
+                # batches; _balance_batch adds zero-loss padding when needed.
+                start_ready = (
+                    len(teacher_ready) >= teacher_threshold or len(students.keys) >= student_threshold
+                )
+                if not ready or (not started and not start_ready):
                     time.sleep(self.replay_buffer.poll_interval)
                     continue
-                take = ready[:take_n]
+                take = ready
+                take_n = len(take)
                 chunk = students.select_keys(take)
                 chunk.extra_info.update(self._actor_update_extra_info())
                 chunk = self._balance_batch(

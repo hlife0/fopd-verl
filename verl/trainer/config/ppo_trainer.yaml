@@ -247,9 +247,13 @@ trainer:
       # Requires early_actor_lite and the OPD no-task-reward fast path.
       actor_rollout_overlap: false
 
-      # Maximum real trajectories per Actor chunk; 0 selects one Actor DP group.
-      # Positive values must be divisible by Actor DP size.
+      # Compatibility field: only 0 is supported; each call drains all ready samples.
       actor_rollout_overlap_chunk_size: 0
+
+      # Start once either fraction of this logical batch is complete.
+      # After starting, drain all newly teacher-ready samples without another gate.
+      actor_rollout_overlap_teacher_fraction: 0.5
+      actor_rollout_overlap_student_fraction: 0.75
 
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:

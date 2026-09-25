@@ -59,16 +59,18 @@ def _trainer(batch_size=5):
     return trainer
 
 
-def _wire_stream(trainer, failure=None):
-    """Readiness advances only after F/B, making the pre-barrier ordering test strict."""
+def _wire_stream(trainer, failure=None, readiness=None):
+    """Advance readiness after F/B, or through explicit polling snapshots."""
     order = []
     trained = []
     stage = [0]
     last_student = [None]
     total = len(trainer._actor_overlap_prompt_uids)
 
-    def snapshot():
-        count = 2 if stage[0] == 0 else total
+    polls = [0]
+
+    def snapshot(count=None):
+        count = (3 if stage[0] == 0 else total) if count is None else count
         if count == total and last_student[0] is None:
             last_student[0] = time.time()
         keys = [f"p{i}_0_0" for i in range(count)]
@@ -86,6 +88,11 @@ def _wire_stream(trainer, failure=None):
             assert global_steps == trainer.global_steps
             if failure == "poll" and stage[0] == 1:
                 raise RuntimeError("failed prompt group")
+            if readiness is not None:
+                students, teachers = readiness[min(polls[0], len(readiness) - 1)]
+                polls[0] += 1
+                batch = snapshot(students)
+                return batch, batch.keys[:teachers]
             batch = snapshot()
             return batch, batch.keys
 
@@ -109,7 +116,7 @@ def _wire_stream(trainer, failure=None):
             assert not set(real).intersection(trained)
             trained.extend(real)
             stage[0] += 1
-            if failure == "fb" or (failure == "padded_fb" and len(trained) == total):
+            if failure == "fb" or (failure == "padded_fb" and len(real) < len(batch)):
                 raise RuntimeError("fb failed")
             return {"metrics": {"chunk_fb_s": 0.001, "chunk_fb_start_ts": time.time()}}
 
@@ -143,18 +150,18 @@ def _wire_stream(trainer, failure=None):
     return order, trained
 
 
-def test_overlap_dispatches_before_student_barrier_pads_tail_and_updates_once(padding_cleanup):
+def test_overlap_dispatches_before_student_barrier_pads_partial_batch_and_updates_once(padding_cleanup):
     trainer = _trainer()
     order, trained = _wire_stream(trainer)
     metrics, timing = {}, {}
     batch = trainer._step_once(metrics, timing, 5)
     assert order.index("fb") < order.index("sleep") < order.index("finish")
     assert order.count("sleep") == order.count("finish") == order.count("pad") == 1
-    assert order.count("fb") == 3
+    assert order.count("fb") == 2
     assert "abort" not in order
     assert len(set(trained)) == len(batch) == metrics["actor_rollout_overlap/samples"] == 5
     assert metrics["actor_rollout_overlap/chunks_completed_before_student"] == 1
-    assert metrics["actor_rollout_overlap/samples_completed_before_student"] == 2
+    assert metrics["actor_rollout_overlap/samples_completed_before_student"] == 3
     assert trainer.replay_buffer.poll_interval == 2.0
     assert timing["gen"] > 0 and timing["update_actor"] > 0
     assert padding_cleanup == ["padding"]
@@ -169,7 +176,7 @@ def test_overlap_aborts_held_training_and_restores_poll_on_error(failure, paddin
     assert order.count("abort") == 1
     assert order.count("finish") == int(failure == "finish")
     assert trainer.replay_buffer.poll_interval == 2.0
-    assert padding_cleanup == (["padding"] if failure in ("finish", "padded_fb") else [])
+    assert padding_cleanup == ["padding"]
 
 
 @pytest.mark.parametrize(
@@ -179,7 +186,10 @@ def test_overlap_aborts_held_training_and_restores_poll_on_error(failure, paddin
         ("parameter_sync_step", 2, "parameter_sync_step"),
         ("config.actor_rollout_ref.actor.loss_agg_mode", "seq-mean-token-mean", "token-mean"),
         ("config.trainer.critic_warmup", 1, "critic_warmup"),
-        ("config.trainer.v1.sync.actor_rollout_overlap_chunk_size", -2, "nonnegative"),
+        ("config.trainer.v1.sync.actor_rollout_overlap_chunk_size", -2, "must be 0"),
+        ("config.trainer.v1.sync.actor_rollout_overlap_chunk_size", 4, "must be 0"),
+        ("config.trainer.v1.sync.actor_rollout_overlap_teacher_fraction", 0, "must be in"),
+        ("config.trainer.v1.sync.actor_rollout_overlap_student_fraction", 1.1, "must be in"),
     ],
 )
 def test_overlap_rejects_unsupported_training_semantics(field, value, message):
@@ -192,13 +202,27 @@ def test_overlap_rejects_unsupported_training_semantics(field, value, message):
         trainer._configure_actor_rollout_overlap()
 
 
-def test_overlap_rejects_non_dp_aligned_chunk_cap_before_actor_begin():
-    trainer = _trainer()
-    order, _ = _wire_stream(trainer)
-    trainer.config.trainer.v1.sync.actor_rollout_overlap_chunk_size = 3
-    with pytest.raises(ValueError, match="multiple of Actor DP"):
-        trainer._step_once({}, {}, 5)
-    assert order == []
+@pytest.mark.parametrize(
+    "readiness,expected_chunks,first_students",
+    [
+        ([(5, 3), (5, 4), (8, 8)], [4, 4], 5),
+        ([(5, 3), (6, 3), (8, 8)], [3, 5], 6),
+        ([(6, 3), (6, 4), (8, 8)], [3, 1, 4], 6),
+        ([(8, 0), (8, 8)], [8], 8),
+    ],
+)
+def test_overlap_waits_for_either_threshold_then_drains_every_ready_sample(
+    readiness, expected_chunks, first_students
+):
+    trainer = _trainer(batch_size=8)
+    order, trained = _wire_stream(trainer, readiness=readiness)
+    trainer._step_once({}, {}, 8)
+    events = trainer._trace_actor_chunk_events
+    assert [event["n"] for event in events] == expected_chunks
+    assert all(event["n"] == event["teacher_ready_when_dispatched"] for event in events)
+    assert events[0]["students_done_when_dispatched"] == first_students
+    assert len(trained) == len(set(trained)) == 8
+    assert order.count("begin") == order.count("finish") == 1
 
 
 def test_overlap_restores_poll_when_sample_begin_fails():

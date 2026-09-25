@@ -27,6 +27,8 @@ import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
+
+from verl.utils.mps import role_mps_env
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
@@ -1395,6 +1397,10 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+
+            role = "teacher" if self.is_teacher_model else "student"
+            if not self.is_reward_model:
+                env_vars.update(role_mps_env(role))
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

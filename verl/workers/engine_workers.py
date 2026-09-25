@@ -882,6 +882,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def begin_actor_accumulate(self, loss_normalization_tokens: float | None = None):
+        if os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"):
+            print(f"Actor MPS: percent={os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']} "
+                  f"visible_sms={torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count}",
+                  flush=True)
         self.actor.begin_held_train(loss_normalization_tokens=loss_normalization_tokens)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
