@@ -37,3 +37,26 @@
 - 中途命中、收尾 `num_cached≈0`：最后的完整 prefix 没吃到 cache（挤掉或被清掉），长序列仍集中重算。
 - 全部 `num_cached≈0`：这组训练里标志没有让 worker 去读 cache。
 - `cached=0` 只说明没有复用 KV，不说明 logprob 语义错了。
+
+## 2026-09-26 四卡结论
+
+复用在 worker 上发生了。后 3 步整步没有变快。不改 follow 实现，不再跑一组。
+
+运行 `runs/4gpu-0.6b-from-8b/teacher-follow-incremental-20260926_051904`，`train_exit=0`。`teacher_follow=True`。`runtime_env` 里的 trace / cache 日志指向这个新目录。没有写入 `20260926-strong-sd-early-baseline-035937`。`follow_cache.jsonl` 与 `teacher_requests.jsonl` 都是 4480 行、240 个序列，`hole_fills` 合计 0。`prefill_s` 全是 null，不能用它拆 prefill。`num_cached=0` 只表示该次请求没有复用 KV。
+
+| step | 收尾 cached=0 | 收尾 cached/payload | new/payload | Teacher 尾 | 整步 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0/48 | 1010.7/1047.0 | 0.0379 | 0.128 | 40.422 |
+| 2 | 0/48 | 928.0/978.6 | 0.0329 | 0.061 | 25.777 |
+| 3 | 17/48 | 560.7/1234.9 | 0.2281 | 8.059 | 32.096 |
+| 4 | 0/48 | 1081.7/1172.7 | 0.0427 | 0.104 | 25.904 |
+| 5 | 23/48 | 407.3/1235.9 | 0.2541 | 10.102 | 33.984 |
+| 3–5 | 40/144 | 683.2/1214.5 | 0.0966 | 6.088 | 30.661 |
+
+命中的 step（1、2、4）收尾没有 `cached=0`，新算 token 只占 payload 的约 3–4%，Teacher 尾收到约 0.1 秒。这三段的 Actor-after-Teacher 变成 3.715、2.530、2.923 秒：尾巴缩短后，原来叠在 Teacher 后面的 Actor 露了出来，整步仍在 26 秒附近（step 2、4）。
+
+step 3 和 5 的收尾未命中是更长的序列（payload 平均约 1437 和 1460，命中的约 1124 和 1030）。这两步中途的 cached/payload 也掉到 285.6/513.1 和 232.6/472.0，不是只有最后一条没中。Teacher 尾变成 8.059 和 10.102 秒，长于已公布基线的 4.315 秒。
+
+后 3 步相对已公布表：整步 30.661（+4.466）、Student 20.082（+0.710）、Teacher 尾 6.088（+1.773）、Actor-after-Teacher 1.774（+0.646）、发布 2.645（+1.331）、response tokens 54279.67（+1692.67）。对照不是新的同期 baseline，这组又更慢，所以不把它写成加速。发布变长没有从 cache 表里得到解释。
+
+接口能复用，这一批评分里也复用了；并发时长序列会把 cache 挤掉，收尾重算把 Teacher 尾拉长，命中时整步又被露出来的 Actor 抵消。这条支线停在这里。
