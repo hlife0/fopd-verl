@@ -1016,6 +1016,17 @@ class FSDPEngine(BaseEngine):
                 # materialized while the context is still open (inside the generator).
                 # Materializing after exit silently sends base weights without adapters.
                 return self._merged_lora_per_tensor_param(), None
+        elif fsdp_version(self.module) == 1:
+            # SHARDED_STATE_DICT (set for world_size > 1) already unshards every FSDP unit, then
+            # re-chunks it into DTensors that .full_tensor() below gathers a second time. Keep the
+            # full tensors from that one unshard instead: every rank gets its own clone, with no
+            # rank0-only gather and no scatter. The module's own state_dict type is restored on exit.
+            with FSDP.state_dict_type(
+                self.module,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
+            ):
+                params = self.module.state_dict()
         else:
             params = self.module.state_dict()
 
@@ -1030,13 +1041,16 @@ class FSDPEngine(BaseEngine):
             per_tensor_param = params.items()
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (
-                    name,
-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
-                )
-                for name, param in params.items()
-            )
+
+            def _pop_params(params):
+                # Drop each entry once yielded so FSDP1 full clones are freed as they are sent.
+                for name in list(params):
+                    param = params.pop(name)
+                    if isinstance(param, DTensor):
+                        param = param.to(device, non_blocking=True).full_tensor()
+                    yield name, param
+
+            per_tensor_param = _pop_params(params)
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
 
         if self._qat_enabled:
