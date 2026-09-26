@@ -86,7 +86,7 @@ GPU 1 第二次：capture 在 `LLM()` 初始化里，计时在那之后。batch 
 
 已完成两对、四组新强基线配置。启动内容对应 `7141d545`：两边脚本都把 `runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'` 放进 Hydra，shell 变量 unset。`a9bb6c9c` 曾从脚本拿掉这一行，用来对齐上面缺 GC 的四组；这四组没有改用那一版脚本。GPU 4–7，配方其余不变，只差 Student 图模式。`train_exit=0`，`teacher_follow=False`。四组 ray init 都有该键。日志里没有 `OPD publication GC frozen` warning；缺 warning 是日志传播，发布从 step 3 起约 1.3 秒，说明冻结已经生效。
 
-`PUBLICATION_STATE` 这行 stdout 是在 P1 结束之后、F1 启动之前写进工作区的。所以第一对的观测不一样：P1 的 `train.log` 没有这行；F1 有，`env='2'`、`publication_opt=True`，`freeze_called=True` 只在 `global_steps=2`。第二对两边都保留同一行，运行时代码与 `2b655a22` 相同。
+`PUBLICATION_STATE` 是每次发布一行的状态确认，不是加速来源。图模式以外的配方相同。这行 stdout 是在 P1 结束之后、F1 启动之前写进工作区的，所以第一对观测不一样：P1 的 `train.log` 没有这行；F1 有，`env='2'`、`publication_opt=True`，`freeze_called=True` 只在 `global_steps=2`。第二对两边都保留同一行。
 
 | 运行 | 模式 | 整步 | Student | Teacher尾 | Actor-after-T | 发布 | resp |
 |---|---|---:|---:|---:|---:|---:|---:|
