@@ -72,7 +72,17 @@ Hydra 覆盖的键是 `actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_
 
 Teacher 尾在 FULL 运行上也更短，但 Teacher 两边都是 enforce eager，没有 decode 图。这段不记成 Teacher 优化。发布仍在 2.6 秒附近。`055951` 的 step 5 整步仍可以高于 `052727` 的 step 5，长答顶到 2048 时单步整步会重叠。
 
-本机 0.6B、EAGLE3 k=3、四卡这条配方上，Student 打开 `FULL_AND_PIECEWISE` 比 `PIECEWISE` 更快。不再改图模式、k 或调度去探下一条。
+上面四组和 `052727`、follow 的发布都在 2.6–2.8 秒，而且从 step 1 起就是这条线。这不是 FULL 和 PIECEWISE 之间的差：两对发布差是 +0.044 和 +0.018 秒。
+
+## 发布翻倍
+
+`035937` 后 3 步发布 1.314 秒，逐步 2.075、1.703、1.259、1.320、1.364。`publication-state-20260926_043847` 把 `OPD_PUBLICATION_GC_FREEZE_STEP=2` 只放进 Hydra `runtime_env`，worker 上 `publication_opt=True`，`freeze_called=True` 只在 `global_steps=2`。那次发布逐步 2.049、1.640、1.257、1.273、1.286，后 3 步 1.272 秒。warning 没进 `train.log`，不能用来判断 freeze 有没有跑。
+
+sd-early 的开关在 `update_weights`：变量非空时，`aggressive_empty_cache` 从最多 3 次改成 1 次，并跳过权重同步后的第二次清理；变量等于当前 step 时再 `gc.freeze()`。公平脚本不写这个变量。`035937` 的 Hydra `runtime_env` 里没有它，但发布曲线和确认开过开关的那次一样，对应启动 shell 继承进 worker。`052727`、follow 和上面四组的 ray init 都没有这个键；本分支脚本还 `unset` 了 shell 变量，又没有把它写进 `runtime_env`。发布因此停在大约 2.6 秒，没有 step 2 之后的下落。
+
+其余公共项与 `035937` 的 train.log 一致：offload false、checkpoint backend naive、bucket 2048、`free_cache_engine` true、Teacher enforce eager、EAGLE3 k=3、`calculate_log_probs=True`。没有为了比较把这些改弱。缺的是这一项已经在 sd-early 里的发布开关。交错四组彼此仍然同配置，Student 的差距不是靠拿掉这个开关造出来的；它们不能代替带这个开关的 `035937` 当强基线。
+
+两个启动脚本现在都保持 shell unset，并加上同一条 `runtime_env` 覆盖。图模式仍是唯一差别。用这一对再验一次，不重跑已有目录。
 
 复跑（新目录，GPU 4–7，不要把 profiler 开在计时上）：
 
@@ -81,4 +91,4 @@ bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_d
 bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_decode_graph_4gpu.sh
 ```
 
-PIECEWISE 的 `train.log` 应是 Student `cudagraph_mode=PIECEWISE`，有 prefill PIECEWISE，没有 `Capturing decode CUDA graphs`。FULL 应是 `FULL_AND_PIECEWISE`，并且有 `Capturing decode CUDA graphs (FULL)`。Teacher 进程的 enforce eager 警告两边都会出现。
+PIECEWISE 的 `train.log` 应是 Student `cudagraph_mode=PIECEWISE`，有 prefill PIECEWISE，没有 `Capturing decode CUDA graphs`。FULL 应是 `FULL_AND_PIECEWISE`，并且有 `Capturing decode CUDA graphs (FULL)`。两边的 ray init `env_vars` 都要有 `OPD_PUBLICATION_GC_FREEZE_STEP` 为 `2`。有效时发布在 step 2 之后落到 1.3 秒附近，而不是停在 2.6 秒。没有 `OPD publication GC frozen` 这句 warning 不能当成没冻结。Teacher 进程的 enforce eager 警告两边都会出现。

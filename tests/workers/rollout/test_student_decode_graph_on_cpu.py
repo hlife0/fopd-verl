@@ -73,6 +73,8 @@ def test_launchers_differ_only_by_student_cudagraph_mode():
         _SCRIPTS / "student_decode_piecewise_4gpu.sh",
     ):
         text = path.read_text()
+        assert "unset OPD_PUBLICATION_GC_FREEZE_STEP" in text
+        assert "+ray_kwargs.ray_init.runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'" in text
         assert "calculate_log_probs" not in text
         assert "rejection_sample_method" not in text
         assert "num_speculative_tokens" not in text
