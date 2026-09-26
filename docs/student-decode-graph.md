@@ -51,9 +51,9 @@ Student `calculate_log_probs=True`，每个生成 token 要一个被选 logprob�
 
 覆盖范围按 vLLM 的候选规则：decode 图只收 `decode_query_len <= 尺寸 <= max_num_seqs`。本配方 `max_num_seqs=32`，capture 列表是 4、8、16、32、64、96、128，所以 decode FULL 是 4 档，prefill 仍是 7 档。正式日志里 decode 进度条是 4/4，prefill 是 7/7。图捕获发生在第一步计时之前，不进 `timing_s/step`。GPU 1 的 128-token profile 只在组件日志里，没有和这五次正式计时混在一起。
 
-Hydra 覆盖的键是 `actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode`。Teacher 的 `distillation.yaml` 仍是 `enforce_eager: true`、`engine_kwargs: {}`。Teacher 进程日志里出现的 `FULL_AND_PIECEWISE` 来自 `vllm_async_server` 在没有 compilation_config 时的 `setdefault`，紧接着被 `--enforce_eager` 关掉，没有 decode 图。Actor 的 offload、loss、学习率没有改。相对 `391ac71f` 没有改 verl 运行时代码，只有本分支的启动脚本、说明和 CPU 测试。
+Hydra 覆盖的键是 `actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode`。Teacher 的 `distillation.yaml` 仍是 `enforce_eager: true`、`engine_kwargs: {}`。Teacher 进程日志里出现的 `FULL_AND_PIECEWISE` 来自 `vllm_async_server` 在没有 compilation_config 时的 `setdefault`，紧接着被 `--enforce_eager` 关掉，没有 decode 图。Actor 的 offload、loss、学习率没有改。`baseline/sd-early` 本身停在 `391ac71f`。本分支在 `update_weights` 上加了一行两边共用的 `PUBLICATION_STATE` stdout，用来看 worker 里的 freeze 环境；发布冻结条件对 `OPD_PUBLICATION_GC_FREEZE_STEP=2` 与 sd-early 相同。
 
-## 交错复验
+## 旧共同缺GC
 
 同一工作区、同一脚本，只换上面这一个键。顺序是 PIECEWISE、FULL、PIECEWISE、FULL。都是 `train_exit=0`，`teacher_follow=False`，每步 48 条，aborted 0，loss 和 grad 有限。没有重跑 `052727`，没有 profiler。
 
@@ -72,7 +72,7 @@ Hydra 覆盖的键是 `actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_
 
 Teacher 尾在 FULL 运行上也更短，但 Teacher 两边都是 enforce eager，没有 decode 图。这段不记成 Teacher 优化。发布仍在 2.6 秒附近。`055951` 的 step 5 整步仍可以高于 `052727` 的 step 5，长答顶到 2048 时单步整步会重叠。
 
-两对后 3 步均值：P 臂 28.6205 / 19.1285 / 5.558 / 1.2505 / 2.621 / 56227.67，F 臂 25.5495 / 17.1035 / 4.574 / 1.1515 / 2.652 / 55145.33。F 相对 P：整步 −3.071 秒（10.73%），Student −2.025 秒（10.59%），response −1082.34（−1.92%）。发布差约 +0.03 秒。两对都是 F 更快。推荐这条 Student 图模式。不要求更长训练、逐 token logprob 相等或第三对。
+两对后 3 步均值：P 臂 28.6205 / 19.1285 / 5.558 / 1.2505 / 2.621 / 56227.67，F 臂 25.5495 / 17.1035 / 4.574 / 1.1515 / 2.652 / 55145.33。F 相对 P：整步 −3.071 秒（10.73%），Student −2.025 秒（10.59%），response −1082.34（−1.92%）。发布差约 +0.03 秒。这两对发布都在 2.6 秒，是共同漏了 `OPD_PUBLICATION_GC_FREEZE_STEP`。这组数字单独保留，不和下面强基线的均值混在一起。
 
 ## 验收
 
@@ -82,11 +82,23 @@ GPU 1 第二次：capture 在 `LLM()` 初始化里，计时在那之后。batch 
 
 四组 Hydra 的 Student/Teacher 显存 0.4/0.85、两边 `max_num_seqs=32`、`max_num_batched_tokens=8192` 相同。`train.log` 没有 preemption 字样，也没有 GPU block 数。KV 容量的实际块数缺失，不补。接受长度、acceptance rate 也没有记录。`actor/distillation/ppo_kl` 有：四组五步都在 0.000388–0.001250，loss 有限，在 0.088–0.300。没有爆炸。采样仍是 `rejection_sample_method=standard`、k=3、`draft_sample_method=greedy`。Teacher 四组都是 `enforce_eager: true`，decode FULL 图不在 Teacher 上。
 
-## 发布
+## 强baseline正确GC
 
-`035937` 后 3 步发布 1.314 秒，逐步 2.075、1.703、1.259、1.320、1.364。`publication-state-20260926_043847` 用 Hydra `runtime_env` 传入 `OPD_PUBLICATION_GC_FREEZE_STEP=2`，worker `freeze_called=True` 只在 step 2，后 3 步发布 1.272 秒。缺 warning 不能判断没冻结。公平脚本不写这个变量。`035937` 的打印里没有它，发布曲线却和开过开关的那次相同。四组和 `052727`、follow 的 ray init 都没有这个键，脚本还 unset 了 shell 变量，发布从 step 1 起就是 2.6–2.8 秒。
+启动内容对应 `7141d545`：两边脚本都把 `runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'` 放进 Hydra，shell 变量 unset。`a9bb6c9c` 曾从脚本拿掉这一行，用来对齐上面缺 GC 的四组；这对没有改用那一版脚本。GPU 4–7，配方其余不变，只差 Student 图模式。`train_exit=0`，`teacher_follow=False`。两边 ray init 都有该键。日志里没有 `OPD publication GC frozen` warning；缺 warning 是日志传播，发布从 step 3 起约 1.3 秒，说明冻结已经生效。P 的 `train.log` 没有 `PUBLICATION_STATE` 行。F 启动时工作区已经有这行 stdout，日志里 `env='2'`、`mode='naive'`、`publication_opt=True`，`freeze_called=True` 只出现在 `global_steps=2`。
 
-这是四组共同的遗漏，不是 F 和 P 之间的配置差。发布差 +0.044 / +0.018 秒。offload、naive backend、bucket 2048、`free_cache_engine` 与 `035937` 相同，没有把基线改弱。不再为发布加跑。这组的 2.6 秒发布不能拿去和 `035937` 的 1.3 秒比绝对整步。`student-decode-piecewise-20260926_153646` 是中止的启动，不是测量。
+| 运行 | 模式 | 整步 | Student | Teacher尾 | Actor-after-T | 发布 | resp |
+|---|---|---:|---:|---:|---:|---:|---:|
+| piecewise-154529 | PIECEWISE | 26.068 | 19.160 | 4.542 | 1.003 | 1.300 | 52980.67 |
+| graph-155943 | FULL | 23.958 | 17.304 | 4.046 | 1.237 | 1.300 | 55804.33 |
+| 155943 减 154529 |  | -2.110 | -1.856 | -0.496 | +0.234 | 0.000 | +2823.67 |
+
+P 逐步：39.788 / 19.926 / 2.923 / 1.494 / 2.060 / 48193（9）；25.378 / 19.196 / 3.403 / 1.009 / 1.687 / 45534（8）；26.624 / 19.249 / 4.949 / 1.070 / 1.293 / 54250（11）；25.873 / 19.449 / 4.199 / 0.894 / 1.270 / 49497（11）；25.707 / 18.781 / 4.478 / 1.046 / 1.338 / 55195（10）。没有 `Capturing decode CUDA graphs`。
+
+F 逐步：35.768 / 15.756 / 3.008 / 1.901 / 1.998 / 46927（7）；22.476 / 16.649 / 2.496 / 1.559 / 1.704 / 48779（9）；24.765 / 17.323 / 4.643 / 1.439 / 1.297 / 57754（10）；21.613 / 16.797 / 2.043 / 1.384 / 1.313 / 51697（9）；25.497 / 17.792 / 5.453 / 0.889 / 1.289 / 57962（14）。有 `Capturing decode CUDA graphs (FULL)`。
+
+五步整步和五步 Student 都是 FULL 更短。后 3 步 F 的 response 多 2823.67，step 3 也是 F 的 token 更多（57754 对 54250）而 Student 更短（17.323 对 19.249）。Teacher 尾更短，Teacher 仍是 enforce eager。发布后 3 步两边都是 1.300，与 `035937` 的 1.314、`publication-state-20260926_043847` 的 1.272 同一水平。每步 48 条，aborted 0。P 的 loss 0.112–0.298、`ppo_kl` 0.000596–0.000899；F 的 loss 0.110–0.279、`ppo_kl` 0.000553–0.001236。没有显存报错，日志无 preemption。这一对不再加跑。
+
+不进入这对均值：`student-decode-piecewise-gc-20260926_155411`、`student-decode-piecewise-gc-20260926_160530` 是额外的完整 PIECEWISE。`153646`、`155110`、`155254`、`155956`、`161100` 是中止或初始化失败，不是结果。
 
 复跑（新目录，GPU 4–7，不要开 profiler，不要复用上述目录）：
 
@@ -95,4 +107,4 @@ bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_d
 bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_decode_graph_4gpu.sh
 ```
 
-PIECEWISE 的日志应是 Student `cudagraph_mode=PIECEWISE`，有 prefill PIECEWISE，没有 `Capturing decode CUDA graphs`。FULL 应是 `FULL_AND_PIECEWISE`，并且有 `Capturing decode CUDA graphs (FULL)`。ray init 不应出现 `OPD_PUBLICATION_GC_FREEZE_STEP`。Teacher 的 enforce eager 警告两边都有。
+两个脚本都 unset shell 变量，并传入 `+ray_kwargs.ray_init.runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'`。ray init 应有该键。`PUBLICATION_STATE` 里 `env='2'`、`freeze_called=True` 只在 `global_steps=2`。缺 warning 不能当成没冻结。PIECEWISE 没有 `Capturing decode CUDA graphs`。FULL 有 `Capturing decode CUDA graphs (FULL)`。Teacher 的 enforce eager 警告两边都有。

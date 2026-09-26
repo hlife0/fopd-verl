@@ -74,11 +74,20 @@ def test_launchers_differ_only_by_student_cudagraph_mode():
     ):
         text = path.read_text()
         assert "unset OPD_PUBLICATION_GC_FREEZE_STEP" in text
-        assert "OPD_PUBLICATION_GC_FREEZE_STEP='2'" not in text
+        assert "+ray_kwargs.ray_init.runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'" in text
         assert "calculate_log_probs" not in text
         assert "rejection_sample_method" not in text
         assert "num_speculative_tokens" not in text
         assert "loss_mode" not in text
+
+
+def test_publication_state_line_is_shared_worker_stdout():
+    text = (_REPO / "verl/workers/engine_workers.py").read_text()
+    assert "PUBLICATION_STATE " in text
+    freeze_at = text.index("gc.freeze()")
+    called_at = text.index("freeze_called = True", freeze_at)
+    log_at = text.index("self._log_publication_state(global_steps, effective_mode, freeze_called=freeze_called)")
+    assert freeze_at < called_at < log_at
 
 
 def test_fair_recipe_keeps_eagle3_k3_and_logprobs():

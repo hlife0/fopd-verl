@@ -844,6 +844,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    def _log_publication_state(self, global_steps, effective_mode: str, freeze_called: bool) -> None:
+        """One line per publish call. stdout, so a missed logger handler cannot hide it."""
+        freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
+        print(
+            "PUBLICATION_STATE "
+            f"global_steps={global_steps!r} type={type(global_steps).__name__} "
+            f"env={freeze_step!r} mode={effective_mode!r} "
+            f"publication_opt={bool(freeze_step)} gc_enabled={gc.isenabled()} "
+            f"freeze_called={bool(freeze_called)} rank={getattr(self, 'rank', None)}",
+            flush=True,
+        )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.
@@ -876,6 +888,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
+            self._log_publication_state(global_steps, effective_mode, freeze_called=False)
             if effective_mode == "delta_sharded":
                 # the delta engine owns the sync state machine (seed vs steady,
                 # snapshot prime), so it drives the training engine itself.
@@ -888,11 +901,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         set_expandable_segments(False)
         freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
         publication_opt = bool(freeze_step)
-        if publication_opt and global_steps == int(freeze_step):
+        freeze_step_int = None
+        if publication_opt:
+            try:
+                freeze_step_int = int(freeze_step)
+            except ValueError:
+                freeze_step_int = None
+        freeze_called = False
+        if publication_opt and freeze_step_int is not None and global_steps == freeze_step_int:
             # Warm-up boundary: later cleanup scans only objects allocated after this.
             gc.collect()
             gc.freeze()
+            freeze_called = True
             logger.warning("OPD publication GC frozen at global step %s", global_steps)
+        self._log_publication_state(global_steps, effective_mode, freeze_called=freeze_called)
         aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
