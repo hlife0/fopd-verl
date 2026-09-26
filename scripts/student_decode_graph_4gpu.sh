@@ -2,9 +2,8 @@
 # One 5-step 4-GPU run. Same sd-early recipe, one config change:
 # Student vLLM cudagraph_mode FULL_AND_PIECEWISE instead of PIECEWISE.
 # EAGLE3 k stays 3. teacher_follow stays false. Do not reuse an existing run directory.
-# Publication GC freeze is the sd-early switch. The shell variable is unset so
-# workers receive it only through Hydra runtime_env, the path that reached
-# workers on publication-state-20260926_043847.
+# The shell freeze variable is unset and is not passed in runtime_env.
+# That matches the measured pairs. Do not add it on only one side.
 set -euo pipefail
 cd /csproject/fyp26_bl1/fopd
 unset OPD_PUBLICATION_GC_FREEZE_STEP
@@ -27,5 +26,4 @@ exec bash scripts/fair_compare/4gpu-0.6b-from-8b.sh \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.max_num_seqs=32 \
     distillation.teacher_models.teacher_model.inference.max_num_seqs=32 \
-    actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_AND_PIECEWISE \
-    "+ray_kwargs.ray_init.runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'"
+    actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_AND_PIECEWISE

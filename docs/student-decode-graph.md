@@ -72,23 +72,27 @@ Hydra 覆盖的键是 `actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_
 
 Teacher 尾在 FULL 运行上也更短，但 Teacher 两边都是 enforce eager，没有 decode 图。这段不记成 Teacher 优化。发布仍在 2.6 秒附近。`055951` 的 step 5 整步仍可以高于 `052727` 的 step 5，长答顶到 2048 时单步整步会重叠。
 
-上面四组和 `052727`、follow 的发布都在 2.6–2.8 秒，而且从 step 1 起就是这条线。这不是 FULL 和 PIECEWISE 之间的差：两对发布差是 +0.044 和 +0.018 秒。
+两对后 3 步均值：P 臂 28.6205 / 19.1285 / 5.558 / 1.2505 / 2.621 / 56227.67，F 臂 25.5495 / 17.1035 / 4.574 / 1.1515 / 2.652 / 55145.33。F 相对 P：整步 −3.071 秒（10.73%），Student −2.025 秒（10.59%），response −1082.34（−1.92%）。发布差约 +0.03 秒。两对都是 F 更快。推荐这条 Student 图模式。不要求更长训练、逐 token logprob 相等或第三对。
 
-## 发布翻倍
+## 验收
 
-`035937` 后 3 步发布 1.314 秒，逐步 2.075、1.703、1.259、1.320、1.364。`publication-state-20260926_043847` 把 `OPD_PUBLICATION_GC_FREEZE_STEP=2` 只放进 Hydra `runtime_env`，worker 上 `publication_opt=True`，`freeze_called=True` 只在 `global_steps=2`。那次发布逐步 2.049、1.640、1.257、1.273、1.286，后 3 步 1.272 秒。warning 没进 `train.log`，不能用来判断 freeze 有没有跑。
+捕获图不等于每步都 replay。vLLM 在 draft 的第 2、3 步把 batch 标成每个请求 1 token，再 `dispatch`。命中 FULL 描述符时 `run_fullgraph` 调用 `graph.replay()`；对不上则返回 `NONE`，draft decode 走 eager。本配方 `max_num_seqs=32`，decode FULL 只捕获 4、8、16、32。token 数 1–32 会 pad 到下一档再 replay，不是掉回 eager。单副本不能超过 32 条，所以 draft decode 不会因尺寸超出已捕获档而回退。prefill 和长短不一的 mixed batch 仍走 piecewise。四卡 `train.log` 没有逐步 replay 次数（`cudagraph_metrics` 没开），不把捕获行写成每步计数。
 
-sd-early 的开关在 `update_weights`：变量非空时，`aggressive_empty_cache` 从最多 3 次改成 1 次，并跳过权重同步后的第二次清理；变量等于当前 step 时再 `gc.freeze()`。公平脚本不写这个变量。`035937` 的 Hydra `runtime_env` 里没有它，但发布曲线和确认开过开关的那次一样，对应启动 shell 继承进 worker。`052727`、follow 和上面四组的 ray init 都没有这个键；本分支脚本还 `unset` 了 shell 变量，又没有把它写进 `runtime_env`。发布因此停在大约 2.6 秒，没有 step 2 之后的下落。
+GPU 1 第二次：capture 在 `LLM()` 初始化里，计时在那之后。batch 16 正好是捕获档。PIECEWISE 1.007 秒，FULL_AND_PIECEWISE 0.824 秒，16×128 token id 相同。这是 replay 窗口，不是 capture 开销，也不是四卡整步。
 
-其余公共项与 `035937` 的 train.log 一致：offload false、checkpoint backend naive、bucket 2048、`free_cache_engine` true、Teacher enforce eager、EAGLE3 k=3、`calculate_log_probs=True`。没有为了比较把这些改弱。缺的是这一项已经在 sd-early 里的发布开关。交错四组彼此仍然同配置，Student 的差距不是靠拿掉这个开关造出来的；它们不能代替带这个开关的 `035937` 当强基线。
+四组 Hydra 的 Student/Teacher 显存 0.4/0.85、两边 `max_num_seqs=32`、`max_num_batched_tokens=8192` 相同。`train.log` 没有 preemption 字样，也没有 GPU block 数。KV 容量的实际块数缺失，不补。接受长度、acceptance rate 也没有记录。`actor/distillation/ppo_kl` 有：四组五步都在 0.000388–0.001250，loss 有限，在 0.088–0.300。没有爆炸。采样仍是 `rejection_sample_method=standard`、k=3、`draft_sample_method=greedy`。Teacher 四组都是 `enforce_eager: true`，decode FULL 图不在 Teacher 上。
 
-两个启动脚本现在都保持 shell unset，并加上同一条 `runtime_env` 覆盖。图模式仍是唯一差别。用这一对再验一次，不重跑已有目录。
+## 发布
 
-复跑（新目录，GPU 4–7，不要把 profiler 开在计时上）：
+`035937` 后 3 步发布 1.314 秒，逐步 2.075、1.703、1.259、1.320、1.364。`publication-state-20260926_043847` 用 Hydra `runtime_env` 传入 `OPD_PUBLICATION_GC_FREEZE_STEP=2`，worker `freeze_called=True` 只在 step 2，后 3 步发布 1.272 秒。缺 warning 不能判断没冻结。公平脚本不写这个变量。`035937` 的打印里没有它，发布曲线却和开过开关的那次相同。四组和 `052727`、follow 的 ray init 都没有这个键，脚本还 unset 了 shell 变量，发布从 step 1 起就是 2.6–2.8 秒。
+
+这是四组共同的遗漏，不是 F 和 P 之间的配置差。发布差 +0.044 / +0.018 秒。offload、naive backend、bucket 2048、`free_cache_engine` 与 `035937` 相同，没有把基线改弱。不再为发布加跑。这组的 2.6 秒发布不能拿去和 `035937` 的 1.3 秒比绝对整步。`student-decode-piecewise-20260926_153646` 是中止的启动，不是测量。
+
+复跑（新目录，GPU 4–7，不要开 profiler，不要复用上述目录）：
 
 ```bash
 bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_decode_piecewise_4gpu.sh
 bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_decode_graph_4gpu.sh
 ```
 
-PIECEWISE 的 `train.log` 应是 Student `cudagraph_mode=PIECEWISE`，有 prefill PIECEWISE，没有 `Capturing decode CUDA graphs`。FULL 应是 `FULL_AND_PIECEWISE`，并且有 `Capturing decode CUDA graphs (FULL)`。两边的 ray init `env_vars` 都要有 `OPD_PUBLICATION_GC_FREEZE_STEP` 为 `2`。有效时发布在 step 2 之后落到 1.3 秒附近，而不是停在 2.6 秒。没有 `OPD publication GC frozen` 这句 warning 不能当成没冻结。Teacher 进程的 enforce eager 警告两边都会出现。
+PIECEWISE 的日志应是 Student `cudagraph_mode=PIECEWISE`，有 prefill PIECEWISE，没有 `Capturing decode CUDA graphs`。FULL 应是 `FULL_AND_PIECEWISE`，并且有 `Capturing decode CUDA graphs (FULL)`。ray init 不应出现 `OPD_PUBLICATION_GC_FREEZE_STEP`。Teacher 的 enforce eager 警告两边都有。

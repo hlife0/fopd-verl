@@ -2,7 +2,8 @@
 # One 5-step 4-GPU control. Same worktree and recipe as
 # student_decode_graph_4gpu.sh, with cudagraph_mode left at PIECEWISE.
 # EAGLE3 k stays 3. teacher_follow stays false. Do not reuse an existing run directory.
-# Publication GC freeze matches the FULL launcher: shell unset, Hydra runtime_env=2.
+# The shell freeze variable is unset and is not passed in runtime_env.
+# That matches the measured pairs. Do not add it on only one side.
 set -euo pipefail
 cd /csproject/fyp26_bl1/fopd
 unset OPD_PUBLICATION_GC_FREEZE_STEP
@@ -25,5 +26,4 @@ exec bash scripts/fair_compare/4gpu-0.6b-from-8b.sh \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.max_num_seqs=32 \
     distillation.teacher_models.teacher_model.inference.max_num_seqs=32 \
-    actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=PIECEWISE \
-    "+ray_kwargs.ray_init.runtime_env.env_vars.OPD_PUBLICATION_GC_FREEZE_STEP='2'"
+    actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=PIECEWISE
