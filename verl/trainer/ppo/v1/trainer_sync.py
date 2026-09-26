@@ -116,8 +116,11 @@ class PPOTrainerSync(PPOTrainer):
     def _configure_early_actor_lite(self) -> None:
         sync_config = self.config.trainer.v1.sync
         self.early_actor_lite = bool(sync_config.get("early_actor_lite", False))
+        self.actor_defer_grad_sync = bool(sync_config.get("actor_defer_grad_sync", False))
         if not self.early_actor_lite:
             self.early_actor_stream_fb = False
+            if self.actor_defer_grad_sync:
+                raise ValueError("actor_defer_grad_sync requires early_actor_lite streaming F/B")
             return
         filter_groups = self.config.algorithm.get("filter_groups", None)
         if filter_groups is not None and filter_groups.get("enable", False):
@@ -138,6 +141,8 @@ class PPOTrainerSync(PPOTrainer):
             and not getattr(self, "use_critic", False)
             and not getattr(self, "use_reference_policy", False)
         )
+        if self.actor_defer_grad_sync and not (self.early_actor_stream_fb and strategy == "fsdp"):
+            raise ValueError("actor_defer_grad_sync requires early_actor_lite streaming F/B with FSDP1")
         if self.early_actor_stream_fb:
             logger.info(
                 "early_actor_lite: sleep Student vLLM after the Student barrier, then stream "
@@ -290,6 +295,8 @@ class PPOTrainerSync(PPOTrainer):
                         chunk.extra_info = {}
                     chunk.extra_info.update(student_batch.extra_info)
                     chunk.extra_info.update(extra_info)
+                    if self.actor_defer_grad_sync:
+                        chunk.extra_info["defer_grad_sync"] = not is_last
                     chunk = self._balance_batch(
                         chunk,
                         metrics=metrics,

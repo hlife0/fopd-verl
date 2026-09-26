@@ -716,6 +716,22 @@ class FSDPEngine(BaseEngine):
         else:
             yield
 
+    def _upcast_deferred_grads(self):
+        """Hold the unsharded no_sync gradients in the FSDP reduce dtype.
+
+        Under ``no_sync()`` FSDP1 leaves each backward's unsharded gradient in the compute (param)
+        dtype and autograd keeps summing later backwards into it. Upcasting after every deferred
+        backward keeps a cross-chunk sum in the reduce dtype, as the per-chunk reduce-scatter path
+        accumulates it; the next synced backward then reduce-scatters that sum without a cast.
+        """
+        for module in FSDP.fsdp_modules(self.module):
+            handle = module._handle
+            if handle is None:
+                continue
+            grad = handle.flat_param.grad
+            if grad is not None and grad.dtype != handle._reduce_dtype:
+                grad.data = grad.data.to(handle._reduce_dtype)
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -737,6 +753,15 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        # Set by the streamed Actor update (trainer.v1.sync.actor_defer_grad_sync) on every chunk but
+        # the last one of the optimizer step: none of this chunk's micro-batches reduce-scatter, and
+        # the final chunk's first synced backward reduces the whole sum. Same value on every dp rank.
+        defer_chunk_sync = tu.get(data, key="defer_grad_sync", default=False)
+        assert isinstance(defer_chunk_sync, bool), f"defer_grad_sync must be one bool, got {defer_chunk_sync!r}"
+        defer_chunk_sync = defer_chunk_sync and not forward_only
+        if defer_chunk_sync and (fsdp_version(self.module) != 1 or self._is_offload_param):
+            raise NotImplementedError("defer_grad_sync supports FSDP1 without param offload only")
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
@@ -750,11 +775,12 @@ class FSDPEngine(BaseEngine):
         scaler = getattr(self, "scaler", None)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            sync_ctx = (
-                nullcontext()
-                if forward_only
-                else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
-            )
+            if forward_only:
+                sync_ctx = nullcontext()
+            elif defer_chunk_sync:
+                sync_ctx = self.module.no_sync()
+            else:
+                sync_ctx = self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
             # Name each micro-batch in the trace. Without this a forward-only stage
             # (compute_log_prob / compute_ref_log_prob) is a single row with anonymous forwards
             # inside; here every micro-batch forward (and, when training, its backward) becomes a
@@ -773,6 +799,8 @@ class FSDPEngine(BaseEngine):
                         # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
                         # Specialized callers such as Tinker may opt in when their response requires these outputs.
                         meta_info.pop("model_output", None)
+                    if defer_chunk_sync:
+                        self._upcast_deferred_grads()
 
             output_lst.append(meta_info)
 

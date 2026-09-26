@@ -243,6 +243,10 @@ trainer:
       # Without the fast path, leftover Teacher overlaps old_log_prob instead.
       early_actor_lite: false
 
+      # Streamed Actor F/B only (FSDP1, no param offload): skip the gradient reduce-scatter on every
+      # chunk but the last of the optimizer step, which reduces the fp32 sum once.
+      actor_defer_grad_sync: false
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

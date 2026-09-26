@@ -437,6 +437,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def abort_held_train(self):
         if self._held_train_ctx is None:
             return
+        # Drop partial gradients now; a deferred-sync abort would otherwise keep full unsharded grads.
+        self.engine.optimizer_zero_grad()
         self._close_held_train(step=False)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)

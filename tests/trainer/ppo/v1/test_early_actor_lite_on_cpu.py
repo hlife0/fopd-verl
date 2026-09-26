@@ -24,6 +24,7 @@ def _lite_trainer() -> PPOTrainerSync:
     trainer = PPOTrainerSync.__new__(PPOTrainerSync)
     trainer.early_actor_lite = True
     trainer.early_actor_stream_fb = False
+    trainer.actor_defer_grad_sync = False
     trainer.opd_no_task_reward_fast_path = False
     trainer.use_reference_policy = False
     trainer.use_critic = False
@@ -77,11 +78,14 @@ def test_early_actor_lite_sleeps_then_overlaps_old_log_prob_before_sample():
     assert batch.extra_info["temperature"] == 1.0
 
 
-def test_early_actor_lite_streams_fb_on_teacher_ready_before_sample():
+@pytest.mark.parametrize("defer_grad_sync", [False, True])
+def test_early_actor_lite_streams_fb_on_teacher_ready_before_sample(defer_grad_sync):
     trainer = _lite_trainer()
     trainer.opd_no_task_reward_fast_path = True
     trainer.early_actor_stream_fb = True
+    trainer.actor_defer_grad_sync = defer_grad_sync
     order: list[str] = []
+    chunk_flags: list = []
 
     class ReplayBufferStub:
         poll_interval = 2.0
@@ -136,6 +140,7 @@ def test_early_actor_lite_streams_fb_on_teacher_ready_before_sample():
 
         def accumulate_actor(self, batch):
             order.append("accumulate")
+            chunk_flags.append(batch.extra_info.get("defer_grad_sync"))
             return {"metrics": {"mfu": 0.1, "chunk_fb_s": 0.01}}
 
         def finish_actor_accumulate(self):
@@ -164,6 +169,8 @@ def test_early_actor_lite_streams_fb_on_teacher_ready_before_sample():
     assert "abort" not in order
     assert order.count("accumulate") == 2
     assert "chunk:2" in order
+    # Only the chunk that closes the optimizer step reduce-scatters when deferral is on.
+    assert chunk_flags == ([True, False] if defer_grad_sync else [None, None])
     assert trainer.replay_buffer.poll_interval == 2.0
     assert batch.extra_info["temperature"] == 1.0
 
@@ -172,6 +179,13 @@ def test_early_actor_lite_rejects_group_filtering():
     trainer = _lite_trainer()
     trainer.config.algorithm.filter_groups.enable = True
     with pytest.raises(ValueError, match="group filtering"):
+        trainer._configure_early_actor_lite()
+
+
+def test_actor_defer_grad_sync_requires_streamed_fsdp1():
+    trainer = _lite_trainer()
+    trainer.config.trainer.v1.sync.actor_defer_grad_sync = True
+    with pytest.raises(ValueError, match="actor_defer_grad_sync"):
         trainer._configure_early_actor_lite()
 
 
