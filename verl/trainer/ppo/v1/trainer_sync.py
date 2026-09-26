@@ -337,6 +337,8 @@ class PPOTrainerSync(PPOTrainer):
         if output is not None:
             self._apply_actor_update_metrics(output, metrics)
         metrics["early_actor_lite/chunks"] = len(chunk_sizes)
+        if self.actor_defer_grad_sync:
+            metrics["early_actor_lite/deferred_sync_chunks"] = len(chunk_sizes) - 1
         if chunk_sizes:
             metrics["early_actor_lite/first_chunk"] = chunk_sizes[0]
 

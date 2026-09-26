@@ -761,6 +761,9 @@ class FSDPEngine(BaseEngine):
         defer_chunk_sync = defer_chunk_sync and not forward_only
         if defer_chunk_sync and (fsdp_version(self.module) != 1 or self._is_offload_param):
             raise NotImplementedError("defer_grad_sync supports FSDP1 without param offload only")
+        if defer_chunk_sync and not getattr(self, "_defer_grad_sync_seen", False):
+            self._defer_grad_sync_seen = True
+            logger.warning("defer_grad_sync: first deferred Actor chunk on this rank (reduce-scatter skipped)")
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True

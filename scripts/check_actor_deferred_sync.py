@@ -224,8 +224,9 @@ def worker(rank, model_path, device):
     for name, chunk_groups in SCENARIOS.items():
         ref = run("ref", chunk_groups)
         update = [p - p0 for p, p0 in zip(ref[2], init_params, strict=True)]
-        for mode in ("defer", "bf16"):
-            out = run(mode, chunk_groups)
+        # ref_again: the path's own run-to-run noise (0 on CPU; GPU kernels may not be deterministic).
+        for mode in ("ref_again", "defer", "bf16"):
+            out = run("ref" if mode == "ref_again" else mode, chunk_groups)
             report[(name, mode)] = {
                 "grad": diff(out[0], ref[0]),
                 "grad_norm": (out[1], ref[1]),
