@@ -15,6 +15,7 @@ import functools
 import gc
 import logging
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -411,9 +412,26 @@ class TrainingWorker(Worker, DistProfilerExtension):
             raise RuntimeError("held train is not open")
         maybe_fix_3d_position_ids(data)
         self._inject_train_defaults(data)
+        call_t0 = time.perf_counter()
         global_token_num = self._global_token_num(data)
+        fb_t0 = time.perf_counter()
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev0.record()
         with Timer(name="train_batch", logger=None) as timer:
             output = self.engine.forward_backward_batch(data, loss_function=self.loss_fn, forward_only=False)
+        ev1.record()
+        fb_launch_s = time.perf_counter() - fb_t0
+        ev1.synchronize()
+        fb_wall_s = time.perf_counter() - fb_t0
+        print(
+            f"ACTOR_CHUNK rank={torch.distributed.get_rank()} t0={time.time() - (time.perf_counter() - call_t0):.4f} "
+            f"tokens={sum(global_token_num) if global_token_num else None} "
+            f"local_seqs={len(data['input_ids'].offsets()) - 1 if 'input_ids' in data else None} "
+            f"token_gather_s={fb_t0 - call_t0:.4f} fb_launch_s={fb_launch_s:.4f} fb_wall_s={fb_wall_s:.4f} "
+            f"fb_gpu_span_s={ev0.elapsed_time(ev1) / 1000:.4f}",
+            flush=True,
+        )
         if self.engine.is_mp_src_rank_with_outputs():
             output.pop("model_output", None)
             processed = self._postprocess_output(
@@ -432,7 +450,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def finish_held_train(self):
         if self._held_train_ctx is None:
             raise RuntimeError("held train is not open")
-        return self._close_held_train(step=True)
+        t0 = time.perf_counter()
+        out = self._close_held_train(step=True)
+        torch.cuda.synchronize()
+        print(f"ACTOR_FINISH rank={torch.distributed.get_rank()} wall_s={time.perf_counter() - t0:.4f}", flush=True)
+        return out
 
     def abort_held_train(self):
         if self._held_train_ctx is None:
@@ -831,6 +853,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return self.actor.finish_held_train()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def start_window_trace(self, save_dir: str, label: str):
+        """Start a torch CPU+CUDA trace on rank 0 only; other ranks return immediately."""
+        if self.rank != 0:
+            return
+        activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        self._window_trace = torch.profiler.profile(activities=activities)
+        self._window_trace_path = os.path.join(save_dir, f"{label}_rank0.json.gz")
+        self._window_trace.start()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stop_window_trace(self):
+        prof = getattr(self, "_window_trace", None)
+        if prof is None:
+            return
+        # Kernels still queued at stop would be cut off.
+        torch.cuda.synchronize()
+        prof.stop()
+        os.makedirs(os.path.dirname(self._window_trace_path), exist_ok=True)
+        prof.export_chrome_trace(self._window_trace_path)
+        self._window_trace = None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def abort_actor_accumulate(self):
         self.actor.abort_held_train()
 
@@ -915,7 +959,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             freeze_called = True
             logger.warning("OPD publication GC frozen at global step %s", global_steps)
         self._log_publication_state(global_steps, effective_mode, freeze_called=freeze_called)
-        aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
+        stage_s = {}
+        stage_t = time.perf_counter()
+
+        def mark(name):
+            nonlocal stage_t
+            now = time.perf_counter()
+            stage_s[name] = now - stage_t
+            stage_t = now
+
+        pub_t0 = time.time()
+        with torch.profiler.record_function("pub/pre_empty_cache"):
+            aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
+        mark("pre")
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
@@ -928,7 +984,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # vLLM: level-1 sleep still unmaps weights → must resume.
             resume_weights = self.config.rollout.free_cache_engine
         if resume_weights:
-            await self.rollout.resume(tags=["weights"])
+            with torch.profiler.record_function("pub/wake_weights"):
+                await self.rollout.resume(tags=["weights"])
+        mark("wake_weights")
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
@@ -950,25 +1008,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps
             )
 
-        await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
-        )
+        # gather + IPC copy + vLLM load run inside one sender loop; the sender prints the split.
+        with torch.profiler.record_function("pub/gather_ipc_load"):
+            await self.rollout.update_weights(
+                per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+            )
+        mark("gather_ipc_load")
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         # 3. offload model to cpu
-        if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        if not publication_opt:
-            aggressive_empty_cache(force_sync=True)
+        with torch.profiler.record_function("pub/post_empty_cache"):
+            if self.actor.engine.is_param_offload_enabled:
+                self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            if not publication_opt:
+                aggressive_empty_cache(force_sync=True)
+        mark("post")
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
+            with torch.profiler.record_function("pub/wake_kv"):
+                await self.rollout.resume(tags=["kv_cache"])
+        mark("wake_kv")
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
         set_expandable_segments(True)
+        print(
+            f"PUBLICATION_STAGES step={global_steps} rank={getattr(self, 'rank', None)} t0={pub_t0:.4f} "
+            + " ".join(f"{k}={v:.4f}" for k, v in stage_s.items())
+            + f" total={sum(stage_s.values()):.4f}",
+            flush=True,
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

@@ -648,6 +648,7 @@ class PPOTrainer(ABC):
                     "index": i,
                     "prompt_len": tag.get("prompt_len"),
                     "response_len": tag.get("response_len"),
+                    "student_replica_rank": tag.get("student_replica_rank"),
                     "student_submit_ts": tag.get("student_submit_ts"),
                     "student_first_token_ts": tag.get("student_first_token_ts"),
                     "student_last_token_ts": tag.get("student_last_token_ts"),

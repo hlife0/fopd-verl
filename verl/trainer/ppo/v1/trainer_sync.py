@@ -50,6 +50,18 @@ def _chunk_fb_s(output) -> float | None:
         return None
 
 
+def _window_trace_dir(global_steps) -> str | None:
+    """Output dir when FOPD_WINDOW_TRACE_STEP names this step, else None."""
+    step = os.environ.get("FOPD_WINDOW_TRACE_STEP", "")
+    out_dir = os.environ.get("FOPD_WINDOW_TRACE_DIR", "")
+    if not step or not out_dir:
+        return None
+    try:
+        return out_dir if int(step) == int(global_steps) else None
+    except (TypeError, ValueError):
+        return None
+
+
 @register_trainer("sync")
 class PPOTrainerSync(PPOTrainer):
     """Synchronous PPO trainer
@@ -261,6 +273,8 @@ class PPOTrainerSync(PPOTrainer):
         chunk_events: list[dict] = []
         finalized = False
         output = None
+        trace_dir = _window_trace_dir(self.global_steps)
+        chunk_traced = False
 
         self._trace_actor_start_ts = time.time()
         with marked_timer("update_actor", timing_raw, color="red"):
@@ -296,9 +310,19 @@ class PPOTrainerSync(PPOTrainer):
                         logging_prefix="early_actor_chunk",
                         align_to_mini_batch=False,
                     )
-                    dispatch_ts = time.time()
-                    output = self.actor_rollout_wg.accumulate_actor(chunk)
-                    return_ts = time.time()
+                    trace_chunk = trace_dir is not None and not chunk_traced and take_n == 3
+                    if trace_chunk:
+                        self.actor_rollout_wg.start_window_trace(
+                            trace_dir, f"step{self.global_steps}_actor_chunk_n3"
+                        )
+                    try:
+                        dispatch_ts = time.time()
+                        output = self.actor_rollout_wg.accumulate_actor(chunk)
+                        return_ts = time.time()
+                    finally:
+                        if trace_chunk:
+                            self.actor_rollout_wg.stop_window_trace()
+                            chunk_traced = True
                     consumed.update(take)
                     chunk_sizes.append(take_n)
                     chunk_events.append(
@@ -310,6 +334,7 @@ class PPOTrainerSync(PPOTrainer):
                             "dispatch_ts": dispatch_ts,
                             "return_ts": return_ts,
                             "chunk_fb_s": _chunk_fb_s(output),
+                            "window_trace": trace_chunk,
                         }
                     )
                     if is_last:
@@ -423,11 +448,18 @@ class PPOTrainerSync(PPOTrainer):
             json.dump(payload, fh, indent=2)
 
     def on_step_end(self):
-        self._trace_weights_start_ts = time.time()
-        with marked_timer("update_weights", self.timing_raw, color="red"):
-            # wake up all replicas to update weights
-            self.checkpoint_manager.update_weights(self.global_steps)
-        self._trace_weights_done_ts = time.time()
+        trace_dir = _window_trace_dir(self.global_steps)
+        if trace_dir is not None:
+            self.actor_rollout_wg.start_window_trace(trace_dir, f"step{self.global_steps}_publication")
+        try:
+            self._trace_weights_start_ts = time.time()
+            with marked_timer("update_weights", self.timing_raw, color="red"):
+                # wake up all replicas to update weights
+                self.checkpoint_manager.update_weights(self.global_steps)
+            self._trace_weights_done_ts = time.time()
+        finally:
+            if trace_dir is not None:
+                self.actor_rollout_wg.stop_window_trace()
 
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache

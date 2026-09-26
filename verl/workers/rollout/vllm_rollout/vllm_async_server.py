@@ -720,6 +720,7 @@ class vLLMHttpServer:
 
         extra_fields = {
             "global_steps": self.global_steps,
+            "student_replica_rank": self.replica_rank,
             "student_submit_ts": student_submit_ts,
             "student_first_token_ts": student_first_token_ts or student_last_token_ts,
             "student_last_token_ts": student_last_token_ts,

@@ -20,6 +20,7 @@ Not recommended depending on vllm for this file.
 import gc
 import logging
 import os
+import time
 from multiprocessing import shared_memory
 from typing import Callable, TypedDict
 
@@ -109,15 +110,28 @@ class BucketedWeightSender:
         """
         from verl.workers.rollout.utils import ensure_async_iterator
 
+        t = {"init": 0.0, "gather": 0.0, "copy_launch": 0.0, "sync": 0.0, "ack": 0.0, "cleanup": 0.0}
+        n_buckets = 0
+        wall_t0 = time.time()
+        t_prev = time.perf_counter()
+
+        def lap(key):
+            nonlocal t_prev
+            now = time.perf_counter()
+            t[key] += now - t_prev
+            t_prev = now
+
         try:
             self._init_socket()
             self._init_buffer()
+            lap("init")
 
             # send bucket weights
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             # dtype = PrecisionType.to_dtype(self.config.dtype)
             async for name, weight in ensure_async_iterator(weights):
+                lap("gather")
                 # model parameters are in fp32 full precision
                 # (vermouth1992) we should not force cast weight here because some parameters
                 # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
@@ -133,8 +147,11 @@ class BucketedWeightSender:
                 # fill the tensor bucket
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
                     get_torch_device().synchronize()
+                    lap("sync")
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                     self.socket.recv()
+                    lap("ack")
+                    n_buckets += 1
                     bucket_meta = {}
                     offset = 0
 
@@ -157,13 +174,27 @@ class BucketedWeightSender:
                     weight, non_blocking=True
                 )
                 offset += weight.nbytes
+                lap("copy_launch")
 
             # send the last bucket
             get_torch_device().synchronize()
+            lap("sync")
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
             self.socket.recv()
+            lap("ack")
+            n_buckets += 1
         finally:
             self._cleanup()
+            lap("cleanup")
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else None
+            # gather = next() on the param generator (FSDP full_tensor); sync = GPU drain of
+            # gather + bucket copy; ack = receiver rebuild + vLLM load_weights + its sync.
+            print(
+                f"PUBLICATION_SEND rank={rank} t0={wall_t0:.4f} buckets={n_buckets} "
+                + " ".join(f"{k}={v:.4f}" for k, v in t.items())
+                + f" total={sum(t.values()):.4f}",
+                flush=True,
+            )
 
     def _init_socket(self):
         """Initialize ZMQ REQ socket and bind."""
@@ -277,13 +308,25 @@ class BucketedWeightReceiver:
             (e.g. vLLM ``add_lora``, which takes one adapter dict per call) can
             defer their finalization until the whole adapter has arrived.
         """
+        t = {"init": 0.0, "wait": 0.0, "rebuild": 0.0, "load": 0.0, "cleanup": 0.0}
+        wall_t0 = time.time()
+        t_prev = time.perf_counter()
+
+        def lap(key):
+            nonlocal t_prev
+            now = time.perf_counter()
+            t[key] += now - t_prev
+            t_prev = now
+
         try:
             self._init_socket()
             self._init_buffer()
+            lap("init")
 
             # receive bucket and update weights
             while True:
                 metadata = self.socket.recv_pyobj()
+                lap("wait")
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
@@ -297,14 +340,23 @@ class BucketedWeightReceiver:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
                 is_last = metadata["is_last"]
+                lap("rebuild")
                 on_bucket_received(weights, is_last)
                 get_torch_device().synchronize()
+                lap("load")
                 self.socket.send(b"")
                 del weights, tensor
                 if is_last:
                     break
         finally:
             self._cleanup()
+            lap("cleanup")
+            print(
+                f"PUBLICATION_RECV device={self.device} t0={wall_t0:.4f} "
+                + " ".join(f"{k}={v:.4f}" for k, v in t.items())
+                + f" total={sum(t.values()):.4f}",
+                flush=True,
+            )
 
     def _init_socket(self):
         """Initialize ZMQ REP socket and connect."""

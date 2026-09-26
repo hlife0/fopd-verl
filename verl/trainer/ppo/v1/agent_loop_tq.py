@@ -292,6 +292,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 "student_gen_done_ts": student_gen_done_ts,
             }
             optional_tag = {
+                "student_replica_rank": extra.get("student_replica_rank"),
                 "student_submit_ts": student_submit_ts,
                 "student_first_token_ts": student_first_token_ts,
                 "student_last_token_ts": student_last_token_ts,
