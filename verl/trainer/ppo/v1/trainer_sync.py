@@ -278,7 +278,8 @@ class PPOTrainerSync(PPOTrainer):
 
         self._trace_actor_start_ts = time.time()
         with marked_timer("update_actor", timing_raw, color="red"):
-            self.actor_rollout_wg.begin_actor_accumulate()
+            # Per-chunk CUDA events synchronize, so they only run on the traced step.
+            self.actor_rollout_wg.begin_actor_accumulate(cuda_timing=trace_dir is not None)
             self._trace_fsdp_load_end_ts = time.time()
             try:
                 while len(consumed) < len(traj_keys):

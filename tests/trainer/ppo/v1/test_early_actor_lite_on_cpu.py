@@ -131,7 +131,7 @@ def test_early_actor_lite_streams_fb_on_teacher_ready_before_sample():
             )
 
     class WorkerGroupStub:
-        def begin_actor_accumulate(self):
+        def begin_actor_accumulate(self, cuda_timing=False):
             order.append("begin")
 
         def accumulate_actor(self, batch):

@@ -158,6 +158,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.loss_fn = None
         self._held_train_ctx = None
         self._held_output_lst = []
+        # CUDA-event chunk timing only on the FOPD_WINDOW_TRACE_STEP step; other steps keep CPU timestamps.
+        self._cuda_chunk_timing = False
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -414,22 +416,26 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self._inject_train_defaults(data)
         call_t0 = time.perf_counter()
         global_token_num = self._global_token_num(data)
+        cuda_timing = self._cuda_chunk_timing
         fb_t0 = time.perf_counter()
-        ev0 = torch.cuda.Event(enable_timing=True)
-        ev1 = torch.cuda.Event(enable_timing=True)
-        ev0.record()
+        if cuda_timing:
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
         with Timer(name="train_batch", logger=None) as timer:
             output = self.engine.forward_backward_batch(data, loss_function=self.loss_fn, forward_only=False)
-        ev1.record()
         fb_launch_s = time.perf_counter() - fb_t0
-        ev1.synchronize()
-        fb_wall_s = time.perf_counter() - fb_t0
+        cuda_fields = ""
+        if cuda_timing:
+            ev1.record()
+            ev1.synchronize()
+            fb_wall_s = time.perf_counter() - fb_t0
+            cuda_fields = f" fb_wall_s={fb_wall_s:.4f} fb_gpu_span_s={ev0.elapsed_time(ev1) / 1000:.4f}"
         print(
             f"ACTOR_CHUNK rank={torch.distributed.get_rank()} t0={time.time() - (time.perf_counter() - call_t0):.4f} "
             f"tokens={sum(global_token_num) if global_token_num else None} "
             f"local_seqs={len(data['input_ids'].offsets()) - 1 if 'input_ids' in data else None} "
-            f"token_gather_s={fb_t0 - call_t0:.4f} fb_launch_s={fb_launch_s:.4f} fb_wall_s={fb_wall_s:.4f} "
-            f"fb_gpu_span_s={ev0.elapsed_time(ev1) / 1000:.4f}",
+            f"token_gather_s={fb_t0 - call_t0:.4f} fb_launch_s={fb_launch_s:.4f}{cuda_fields}",
             flush=True,
         )
         if self.engine.is_mp_src_rank_with_outputs():
@@ -452,7 +458,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             raise RuntimeError("held train is not open")
         t0 = time.perf_counter()
         out = self._close_held_train(step=True)
-        torch.cuda.synchronize()
+        if self._cuda_chunk_timing:
+            torch.cuda.synchronize()
         print(f"ACTOR_FINISH rank={torch.distributed.get_rank()} wall_s={time.perf_counter() - t0:.4f}", flush=True)
         return out
 
@@ -838,7 +845,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def begin_actor_accumulate(self):
+    def begin_actor_accumulate(self, cuda_timing: bool = False):
+        self.actor._cuda_chunk_timing = cuda_timing
         self.actor.begin_held_train()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
