@@ -41,6 +41,44 @@ Student `calculate_log_probs=True`，每个生成 token 要一个被选 logprob�
 | 4 | 25.253 | 15.820 | 5.653 | 1.061 | 2.646 | 54250 | 12 | 0.136 | 11.580 |
 | 5 | 28.525 | 17.941 | 6.353 | 1.499 | 2.662 | 62747 | 17 | 0.090 | 10.474 |
 
-每步 48 条，`aborted_ratio=0`，loss 和 grad 有限。五步 Student 都低于 052727 的 21.218 / 19.121 / 19.723 / 19.617 / 19.787。step 5 整步是 28.525，高于 052727 的 28.042；这一步 17 条顶到 2048（052727 是 12 条），response 62747 对 55006，Teacher 尾 6.353 对 4.431。后 3 步 response/Student 秒大约是 3175、3429、3497，052727 是 2673、2905、2780。采样轨迹不同，loss 不能当逐 token 核对。
+每步 48 条，`aborted_ratio=0`，loss 和 grad 有限。五步 Student 都低于 052727 的 21.218 / 19.121 / 19.723 / 19.617 / 19.787。step 5 整步是 28.525，高于 052727 的 28.042；这一步 17 条顶到 2048（052727 是 12 条），response 62747 对 55006，Teacher 尾 6.353 对 4.431。后 3 步 response/Student 秒大约是 3175、3429、3497，052727 是 2673、2905、2780。采样轨迹不同，loss 不能当逐 token 核对。这一组和 `052727` 不是同一时刻的交错对，单独不能当稳定结论。
 
-单次运行。不写成稳定加速。接下来用同一工作区交错两对：`scripts/student_decode_piecewise_4gpu.sh` 与 `scripts/student_decode_graph_4gpu.sh`，顺序是 PIECEWISE、FULL、PIECEWISE、FULL。两边只差 `cudagraph_mode`。不重跑 `052727`，也不把 profiler 开在计时上。
+## 机制
+
+`baseline/sd-early` 的公平脚本把 Student 设成 `PIECEWISE`。vLLM 0.24 的 `FULL_AND_PIECEWISE` 是 `(FULL, PIECEWISE)`：decode 走 FULL，prefill/mixed 走 PIECEWISE。`PIECEWISE` 的 `decode_mode()` 仍是 `PIECEWISE`。EAGLE speculator 只在 `decode_mode()==FULL` 时把 draft decode manager 设成 `FULL_DECODE_ONLY`，否则设成 `NONE`。k=3 时 `num_speculative_steps>1`，所以会去抓 decode 图；`PIECEWISE` 下这张图是空的，每个 verify 之后的 2 次 draft decode 走 eager。`FULL_AND_PIECEWISE` 补的是这段 draft decode，prefill 的 piecewise 图还在。
+
+固定 `num_speculative_tokens=3` 没有 `num_speculative_tokens_per_batch_size`，不是 dynamic speculative decoding，vLLM 不会把 FULL 改回 PIECEWISE。`eagle3` 属于 async scheduling 默认可开的方法。Student `calculate_log_probs=True` 仍在公平脚本里，两个启动脚本都不改它，也不改 `rejection_sample_method=standard`、`draft_sample_method=greedy`。`cudagraph_mode` 不是 `SamplingParams` 的字段。GPU 1 上 temperature 0 的 16×128 token id 相同，只说明这条贪心路径的输出没变；四卡训练温度不是 0，loss 不能当逐 token 核对。
+
+覆盖范围按 vLLM 的候选规则：decode 图只收 `decode_query_len <= 尺寸 <= max_num_seqs`。本配方 `max_num_seqs=32`，capture 列表是 4、8、16、32、64、96、128，所以 decode FULL 是 4 档，prefill 仍是 7 档。正式日志里 decode 进度条是 4/4，prefill 是 7/7。图捕获发生在第一步计时之前，不进 `timing_s/step`。GPU 1 的 128-token profile 只在组件日志里，没有和这五次正式计时混在一起。
+
+Hydra 覆盖的键是 `actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode`。Teacher 的 `distillation.yaml` 仍是 `enforce_eager: true`、`engine_kwargs: {}`。Teacher 进程日志里出现的 `FULL_AND_PIECEWISE` 来自 `vllm_async_server` 在没有 compilation_config 时的 `setdefault`，紧接着被 `--enforce_eager` 关掉，没有 decode 图。Actor 的 offload、loss、学习率没有改。相对 `391ac71f` 没有改 verl 运行时代码，只有本分支的启动脚本、说明和 CPU 测试。
+
+## 交错复验
+
+同一工作区、同一脚本，只换上面这一个键。顺序是 PIECEWISE、FULL、PIECEWISE、FULL。都是 `train_exit=0`，`teacher_follow=False`，每步 48 条，aborted 0，loss 和 grad 有限。没有重跑 `052727`，没有 profiler。
+
+| 运行 | 模式 | 整步 | Student | Teacher尾 | Actor-after-T | 发布 | resp |
+|---|---|---:|---:|---:|---:|---:|---:|
+| piecewise-060904 | PIECEWISE | 28.750 | 19.146 | 5.798 | 1.127 | 2.616 | 55873.67 |
+| graph-061430 | FULL | 25.384 | 16.719 | 4.736 | 1.200 | 2.660 | 54747.33 |
+| 061430 减 060904 |  | -3.366 | -2.427 | -1.062 | +0.073 | +0.044 | -1126 |
+| piecewise-061942 | PIECEWISE | 28.491 | 19.111 | 5.318 | 1.374 | 2.626 | 56581.67 |
+| graph-062506 | FULL | 25.715 | 17.488 | 4.412 | 1.103 | 2.644 | 55543.33 |
+| 062506 减 061942 |  | -2.776 | -1.623 | -0.906 | -0.271 | +0.018 | -1038 |
+
+两对里，FULL 的五步整步和五步 Student 都低于同对 PIECEWISE。后 3 步 Student：060904 是 19.175 / 19.354 / 18.909，061430 是 16.618 / 16.165 / 17.374；061942 是 18.929 / 19.046 / 19.359，062506 是 17.948 / 17.289 / 17.226。三组 FULL 的后 3 步整步均值（25.816、25.384、25.715）都低于两组同期 PIECEWISE（28.750、28.491）和 `052727`（28.908）。Student 均值 16.465、16.719、17.488 都低于 19.146、19.111、19.709。
+
+后 3 步 response/Student 秒：060904 约 2873、3008、2873；061430 约 3355、3264、3207；061942 约 2977、2859、3045；062506 约 2964、3258、3316。061942 的 step 3 和 062506 的 step 3 速率接近，Student 少的约 1 秒对着更少的 response（56359 对 53193），这一步的时间差主要是长度。其余 profile 步 FULL 的速率更高；061430 的 step 3 response 还更多（55761 对 55094），Student 仍是 16.618 对 19.175。
+
+Teacher 尾在 FULL 运行上也更短，但 Teacher 两边都是 enforce eager，没有 decode 图。这段不记成 Teacher 优化。发布仍在 2.6 秒附近。`055951` 的 step 5 整步仍可以高于 `052727` 的 step 5，长答顶到 2048 时单步整步会重叠。
+
+本机 0.6B、EAGLE3 k=3、四卡这条配方上，Student 打开 `FULL_AND_PIECEWISE` 比 `PIECEWISE` 更快。不再改图模式、k 或调度去探下一条。
+
+复跑（新目录，GPU 4–7，不要把 profiler 开在计时上）：
+
+```bash
+bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_decode_piecewise_4gpu.sh
+bash /csproject/fyp26_bl1/fopd/.worktrees/student-decode-graph/scripts/student_decode_graph_4gpu.sh
+```
+
+PIECEWISE 的 `train.log` 应是 Student `cudagraph_mode=PIECEWISE`，有 prefill PIECEWISE，没有 `Capturing decode CUDA graphs`。FULL 应是 `FULL_AND_PIECEWISE`，并且有 `Capturing decode CUDA graphs (FULL)`。Teacher 进程的 enforce eager 警告两边都会出现。
