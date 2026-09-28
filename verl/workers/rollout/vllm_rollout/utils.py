@@ -232,6 +232,10 @@ class vLLMColocateWorkerExtension:
                 yield self._get_drafter_model(), draft_cfg
 
     def monkey_patch_model(self, vocab_size: int, banned_token_ids: Optional[list[int]] = None):
+        if os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"):
+            print(f"vLLM MPS: percent={os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']} "
+                  f"visible_sms={torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count}",
+                  flush=True)
         for model in self._iter_all_models():
             # patch compute_logits to avoid sampling OOV and other illegal tokens
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
