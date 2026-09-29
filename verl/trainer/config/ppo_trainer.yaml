@@ -264,6 +264,10 @@ trainer:
       # context of this many SMs; later F/B and the update use the whole GPU. 0 is off.
       actor_rollout_overlap_green_sms: 0
 
+      # While Student rollout runs, take at most this many samples per F/B (a DP
+      # multiple >= min_samples), so little F/B is in flight when it ends. 0 is no cap.
+      actor_rollout_overlap_rollout_max_samples: 0
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

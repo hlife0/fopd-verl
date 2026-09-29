@@ -261,6 +261,27 @@ def test_overlap_green_sms_only_while_students_run():
     assert [event["green_sms"] for event in events] == [40, 40, 0]
 
 
+def test_overlap_rollout_max_samples_caps_chunks_only_while_students_run():
+    trainer = _trainer(batch_size=8)
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = 2
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_rollout_max_samples = 2
+    _wire_stream(trainer, readiness=[(7, 5), (7, 5), (8, 8)])
+    trainer._step_once({}, {}, 8)
+    events = trainer._trace_actor_chunk_events
+    assert [event["n"] for event in events] == [2, 2, 4]
+
+
+@pytest.mark.parametrize("rollout_max", [3, 4])
+def test_overlap_rejects_bad_rollout_max_samples(rollout_max):
+    trainer = _trainer()
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = 6
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_rollout_max_samples = rollout_max
+    order, _ = _wire_stream(trainer)
+    with pytest.raises(ValueError, match="rollout_max_samples"):
+        trainer._step_once({}, {}, 5)
+    assert order == []
+
+
 def test_overlap_rejects_min_samples_off_dp_before_actor_begin():
     trainer = _trainer()
     trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = 3

@@ -186,8 +186,9 @@ class PPOTrainerSync(PPOTrainer):
                 raise ValueError(f"{name} must be in (0, 1]")
         if int(sync_config.get("actor_rollout_overlap_min_samples", 0)) < 0:
             raise ValueError("actor_rollout_overlap_min_samples must be nonnegative")
-        if int(sync_config.get("actor_rollout_overlap_green_sms", 0)) < 0:
-            raise ValueError("actor_rollout_overlap_green_sms must be nonnegative")
+        for name in ("actor_rollout_overlap_green_sms", "actor_rollout_overlap_rollout_max_samples"):
+            if int(sync_config.get(name, 0)) < 0:
+                raise ValueError(f"{name} must be nonnegative")
         logger.info("actor_rollout_overlap: accumulate scored trajectories before the Student barrier")
 
     def prepare_step(self) -> dict:
@@ -304,9 +305,14 @@ class PPOTrainerSync(PPOTrainer):
         )
         min_samples = int(sync_config.get("actor_rollout_overlap_min_samples", 0))
         green_sms = int(sync_config.get("actor_rollout_overlap_green_sms", 0))
+        rollout_max = int(sync_config.get("actor_rollout_overlap_rollout_max_samples", 0))
         dp_size = self._actor_dp_size()
         if min_samples % dp_size:
             raise ValueError("actor_rollout_overlap_min_samples must be a multiple of Actor DP size")
+        if rollout_max and (not min_samples or rollout_max % dp_size or rollout_max < min_samples):
+            raise ValueError(
+                "actor_rollout_overlap_rollout_max_samples needs min_samples and must be a DP multiple >= it"
+            )
         denominator = sample_batch_size * int(self.config.data.max_response_length)
         consumed: set[str] = set()
         chunks: list[dict] = []
@@ -340,10 +346,15 @@ class PPOTrainerSync(PPOTrainer):
                     len(teacher_ready) >= teacher_threshold or len(students.keys) >= student_threshold
                 )
                 take = ready
+                rollout_running = len(students.keys) < sample_batch_size
                 if min_samples:
                     # Only the last remainder may be short of a DP multiple.
                     if len(ready) < remaining:
                         take = ready[: len(ready) - len(ready) % dp_size]
+                        # A short chunk in flight when the last Student finishes
+                        # delays the Student sleep and the full-GPU chunks.
+                        if rollout_running and rollout_max:
+                            take = take[:rollout_max]
                         if len(take) < min_samples:
                             take = []
                 elif not started and not start_ready:
@@ -354,7 +365,6 @@ class PPOTrainerSync(PPOTrainer):
                 take_n = len(take)
                 chunk = students.select_keys(take)
                 chunk.extra_info.update(self._actor_update_extra_info())
-                rollout_running = len(students.keys) < sample_batch_size
                 chunk.extra_info["actor_green_sms"] = green_sms if rollout_running else 0
                 chunk = self._balance_batch(
                     chunk, metrics=metrics, logging_prefix="early_actor_chunk", align_to_mini_batch=False
