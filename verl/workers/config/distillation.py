@@ -237,6 +237,12 @@ class DistillationConfig(BaseConfig):
         When follow is on, run the Teacher vLLM with priority scheduling and
         send mid-follow prefix requests at a lower priority than requests for
         finished Student sequences, so finished samples are scored first.
+    teacher_follow_mid_max_requests (int):
+        When follow is on, cap on mid-follow Teacher requests in flight (0 = no
+        cap). Split evenly over the AgentLoop workers. Requests for finished
+        Student sequences are never held back.
+    teacher_follow_mid_max_tokens (int):
+        Same, as a cap on the new tokens those mid-follow requests carry.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -276,6 +282,8 @@ class DistillationConfig(BaseConfig):
     teacher_follow: bool = False
     teacher_follow_min_gpu_memory_utilization: float = 0.75
     teacher_follow_priority: bool = False
+    teacher_follow_mid_max_requests: int = 0
+    teacher_follow_mid_max_tokens: int = 0
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)

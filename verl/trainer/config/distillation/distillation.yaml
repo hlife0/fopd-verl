@@ -21,6 +21,11 @@ teacher_follow_min_gpu_memory_utilization: 0.75
 # With follow on: Teacher vLLM uses priority scheduling and scores finished
 # sequences before prefixes of sequences that are still decoding.
 teacher_follow_priority: false
+# With follow on: cap mid-follow Teacher requests in flight, by count and by the
+# new tokens they carry (0 = no cap; split over AgentLoop workers). Requests for
+# finished sequences are never held back.
+teacher_follow_mid_max_requests: 0
+teacher_follow_mid_max_tokens: 0
 
 # distillation loss config
 distillation_loss:

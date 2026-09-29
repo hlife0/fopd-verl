@@ -314,6 +314,7 @@ def _run_follow_with_recorded_priorities(prioritize_done: bool) -> tuple[list[tu
     manager.distillation_loss_config = SimpleNamespace(topk=0, loss_settings=SimpleNamespace(use_topk=False))
     manager.teacher_model_configs = {"t": SimpleNamespace(inference=SimpleNamespace(temperature=1.0))}
     manager.teacher_client = {"t": FakeClient()}
+    manager.follow_mid_gate = None
 
     async def _run():
         state = StudentTokenState()
@@ -359,3 +360,174 @@ def test_configure_teacher_follow_replicas_sets_priority_policy():
 
     assert _configure(True)["scheduling_policy"] == "priority"
     assert "scheduling_policy" not in _configure(False)
+
+
+def test_follow_mid_gate_caps_requests_and_tokens():
+    from verl.experimental.teacher_loop.teacher_follow import FollowMidGate
+
+    gate = FollowMidGate(max_requests=2, max_tokens=100)
+    # One hop is always admitted, even above the token cap.
+    assert gate.try_acquire(500)
+    assert not gate.try_acquire(1)
+    gate.release(500)
+    assert gate.try_acquire(60)
+    assert not gate.try_acquire(41)
+    assert gate.try_acquire(40)
+    assert not gate.try_acquire(0)
+    gate.release(60)
+    gate.release(40)
+    assert (gate.requests, gate.tokens) == (0, 0)
+
+    unlimited = FollowMidGate()
+    assert all(unlimited.try_acquire(10_000) for _ in range(100))
+
+
+def test_follow_mid_gate_wakes_on_release_or_event():
+    import asyncio
+
+    from verl.experimental.teacher_loop.teacher_follow import FollowMidGate
+
+    async def _run():
+        gate = FollowMidGate(max_requests=1)
+        assert gate.try_acquire(16)
+        event = asyncio.Event()
+        waiter = asyncio.create_task(gate.wait_release_or(event))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        gate.release(16)
+        await asyncio.wait_for(waiter, 1.0)
+
+        assert gate.try_acquire(16)
+        waiter = asyncio.create_task(gate.wait_release_or(event))
+        await asyncio.sleep(0)
+        event.set()
+        await asyncio.wait_for(waiter, 1.0)
+        assert gate._waiters == []
+
+    asyncio.run(_run())
+
+
+def test_make_follow_mid_gate_splits_over_workers():
+    from types import SimpleNamespace
+
+    from verl.experimental.teacher_loop.teacher_manager import _make_follow_mid_gate
+
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(agent=SimpleNamespace(num_workers=8)))
+    )
+
+    def _dc(follow=True, requests=0, tokens=0):
+        return SimpleNamespace(
+            teacher_follow=follow, teacher_follow_mid_max_requests=requests, teacher_follow_mid_max_tokens=tokens
+        )
+
+    assert _make_follow_mid_gate(_dc(), config) is None
+    assert _make_follow_mid_gate(_dc(follow=False, requests=8), config) is None
+    gate = _make_follow_mid_gate(_dc(requests=12, tokens=1000), config)
+    assert (gate.max_requests, gate.max_tokens) == (2, 125)
+    gate = _make_follow_mid_gate(_dc(requests=4), config)
+    assert (gate.max_requests, gate.max_tokens) == (1, 0)
+
+
+class _CachingTeacher:
+    """Fake Teacher with a block prefix cache; each request waits until released."""
+
+    def __init__(self, width: int, block: int = 16):
+        self.width = width
+        self.block = block
+        self.cached: set[tuple[int, ...]] = set()
+        self.pending: list[tuple[str, int, int, Any]] = []
+        self.calls: list[tuple[str, int, int]] = []
+
+    def _num_cached(self, prompt_ids: list[int]) -> int:
+        k = (len(prompt_ids) - 1) // self.block * self.block
+        while k > 0 and tuple(prompt_ids[:k]) not in self.cached:
+            k -= self.block
+        return k
+
+    async def generate(self, request_id, *, prompt_ids, sampling_params, priority=0, **kwargs):
+        import asyncio
+        from types import SimpleNamespace
+
+        event = asyncio.Event()
+        self.calls.append((request_id, len(prompt_ids), priority))
+        self.pending.append((request_id, len(prompt_ids), priority, event))
+        await event.wait()
+        n = len(prompt_ids)
+        cached = self._num_cached(prompt_ids)
+        ids, lps = _oneshot_rows(n + 1, self.width)
+        for k in range(self.block, n + 1, self.block):
+            self.cached.add(tuple(prompt_ids[:k]))
+        extra = {
+            "prompt_ids": ids[cached : n - 1] + [[0] * self.width],
+            "prompt_logprobs": lps[cached : n - 1] + [[0.0] * self.width],
+            "num_cached_tokens": cached,
+            "decode_topk_ids": ids[n - 1],
+            "decode_topk_logprobs": lps[n - 1],
+        }
+        return SimpleNamespace(extra_fields=extra)
+
+    def release(self, request_id: str) -> tuple[int, int]:
+        for i, (rid, n, priority, event) in enumerate(self.pending):
+            if rid == request_id:
+                del self.pending[i]
+                event.set()
+                return n, priority
+        raise AssertionError(f"no pending request {request_id}")
+
+
+def test_follow_mid_gate_holds_mid_hops_but_not_finished_requests():
+    import asyncio
+    from types import SimpleNamespace
+
+    from verl.experimental.teacher_loop.teacher_follow import FollowMidGate, StudentTokenState
+    from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+    width = 2
+    teacher = _CachingTeacher(width)
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_config = SimpleNamespace(teacher_follow_priority=True)
+    manager.distillation_loss_config = SimpleNamespace(topk=width, loss_settings=SimpleNamespace(use_topk=True))
+    manager.teacher_model_configs = {"t": SimpleNamespace(inference=SimpleNamespace(temperature=1.0))}
+    manager.teacher_client = {"t": teacher}
+    manager.follow_mid_gate = FollowMidGate(max_requests=1)
+
+    async def _settle():
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    async def _run():
+        a, b = StudentTokenState(), StudentTokenState()
+        a.set_prompt(list(range(8)))
+        b.set_prompt(list(range(50, 58)))
+        a.update_response(list(range(100, 132)))
+        b.update_response(list(range(200, 232)))
+        task_a = asyncio.create_task(manager.compute_teacher_logprobs_follow(a, request_id="a"))
+        task_b = asyncio.create_task(manager.compute_teacher_logprobs_follow(b, request_id="b"))
+        await _settle()
+        # A's block-aligned mid hop holds the only slot; B's hop waits at the gate.
+        assert teacher.calls == [("a", 32, 1)]
+        # B finishes while A's hop is still in flight: its final request goes out at once.
+        b.mark_done()
+        await _settle()
+        assert teacher.calls == [("a", 32, 1), ("b", 40, 0)]
+        teacher.release("b")
+        ids_b, lps_b, _ = await asyncio.wait_for(task_b, 1.0)
+        # A keeps decoding; its next hop waits for its own in-flight hop, then reuses the cache.
+        a.update_response(list(range(100, 148)))
+        teacher.release("a")
+        await _settle()
+        assert teacher.calls[-1] == ("a", 48, 1)
+        a.mark_done()
+        teacher.release("a")
+        await _settle()
+        assert teacher.calls[-1] == ("a", 56, 0)
+        teacher.release("a")
+        ids_a, lps_a, _ = await asyncio.wait_for(task_a, 1.0)
+        assert (manager.follow_mid_gate.requests, manager.follow_mid_gate.tokens) == (0, 0)
+        return (ids_a, lps_a, 56), (ids_b, lps_b, 40)
+
+    for got_ids, got_lps, seq_len in asyncio.run(_run()):
+        want_ids, want_lps = _oneshot_rows(seq_len, width)
+        ok, msg = teacher_topk_equivalent(got_ids, got_lps, torch.tensor(want_ids), torch.tensor(want_lps))
+        assert ok, msg

@@ -23,6 +23,7 @@ from omegaconf import DictConfig
 from torch.nn import functional as F
 
 from verl.experimental.teacher_loop.teacher_follow import (
+    FollowMidGate,
     StudentTokenState,
     TeacherFollowAccumulator,
     TeacherFollowGapError,
@@ -133,6 +134,19 @@ def _pad_teacher_outputs(
     )
 
 
+def _make_follow_mid_gate(distillation_config: DistillationConfig, config: DictConfig) -> Optional[FollowMidGate]:
+    """Split the global mid-follow caps evenly over the AgentLoop workers."""
+    max_requests = int(distillation_config.teacher_follow_mid_max_requests or 0)
+    max_tokens = int(distillation_config.teacher_follow_mid_max_tokens or 0)
+    if not distillation_config.teacher_follow or not (max_requests or max_tokens):
+        return None
+    workers = max(int(config.actor_rollout_ref.rollout.agent.num_workers), 1)
+    return FollowMidGate(
+        max_requests=-(-max_requests // workers),
+        max_tokens=-(-max_tokens // workers),
+    )
+
+
 class AsyncTeacherLLMServerManager:
     """Teacher-specific async client used for distillation logprob computation."""
 
@@ -153,6 +167,7 @@ class AsyncTeacherLLMServerManager:
                 f"do not match teacher routing keys {sorted(expected)}."
             )
         self.teacher_client: dict[str, LLMServerClient] = teacher_client
+        self.follow_mid_gate = _make_follow_mid_gate(self.distillation_config, config)
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
@@ -330,29 +345,48 @@ class AsyncTeacherLLMServerManager:
         request_log: list[dict[str, Any]] = []
 
         prioritize_done = self.distillation_config.teacher_follow_priority
+        gate = self.follow_mid_gate
+        gate_wait_since = None
         while True:
             seq = state.snapshot()
             student_done = state.student_done
             submit_len = follow_submit_len(len(seq), student_done, acc.scored_seq_len)
             if submit_len > acc.scored_seq_len:
+                gate_cost = 0
+                if gate is not None and not student_done:
+                    if not gate.try_acquire(submit_len - acc.scored_seq_len):
+                        # Wait for a slot; the Student finishing sends the final request right away.
+                        if gate_wait_since is None:
+                            gate_wait_since = time.time()
+                        state.event.clear()
+                        if not state.student_done:
+                            await gate.wait_release_or(state.event)
+                        continue
+                    gate_cost = submit_len - acc.scored_seq_len
                 priority = follow_request_priority(student_done, prioritize_done)
                 if teacher_start_ts is None:
                     teacher_start_ts = time.time()
                 scored_before = acc.scored_seq_len
                 submit_ts = time.time()
+                gate_wait_s = submit_ts - gate_wait_since if gate_wait_since is not None else 0.0
+                gate_wait_since = None
                 payload = seq[:submit_len]
-                extra = await self._teacher_forward(
-                    payload,
-                    request_id=request_id,
-                    follow=True,
-                    multi_modal_data=state.multi_modal_data,
-                    mm_processor_kwargs=state.mm_processor_kwargs,
-                    routing_key=routing_key,
-                    priority=priority,
-                )
-                extra_calls = await self._apply_follow_extract(
-                    acc, payload, extra, request_id, routing_key, state, priority
-                )
+                try:
+                    extra = await self._teacher_forward(
+                        payload,
+                        request_id=request_id,
+                        follow=True,
+                        multi_modal_data=state.multi_modal_data,
+                        mm_processor_kwargs=state.mm_processor_kwargs,
+                        routing_key=routing_key,
+                        priority=priority,
+                    )
+                    extra_calls = await self._apply_follow_extract(
+                        acc, payload, extra, request_id, routing_key, state, priority
+                    )
+                finally:
+                    if gate_cost:
+                        gate.release(gate_cost)
                 num_requests += 1 + extra_calls
                 last_cached = int(extra.get("num_cached_tokens") or 0)
                 last_prefill_s = extra.get("engine_prefill_s")
@@ -366,6 +400,7 @@ class AsyncTeacherLLMServerManager:
                     "submit_ts": submit_ts,
                     "student_done": bool(state.student_done),
                     "priority": int(priority),
+                    "gate_wait_s": gate_wait_s,
                     "hole_fills": int(extra_calls),
                 }
                 request_log.append(row)

@@ -178,6 +178,53 @@ def follow_request_priority(student_done: bool, prioritize_done: bool) -> int:
     return 0
 
 
+class FollowMidGate:
+    """Cap mid-follow Teacher requests in flight from one AgentLoop worker.
+
+    Requests for finished Student sequences never take a slot. A mid hop is
+    admitted while the in-flight hop count stays within `max_requests` and the
+    new tokens they carry within `max_tokens` (0 disables a cap); one hop is
+    always admitted when none is in flight, so an oversized hop cannot stall.
+    """
+
+    def __init__(self, max_requests: int = 0, max_tokens: int = 0):
+        self.max_requests = int(max_requests)
+        self.max_tokens = int(max_tokens)
+        self.requests = 0
+        self.tokens = 0
+        self._waiters: list[asyncio.Future] = []
+
+    def try_acquire(self, cost: int) -> bool:
+        if self.requests:
+            if self.max_requests and self.requests >= self.max_requests:
+                return False
+            if self.max_tokens and self.tokens + cost > self.max_tokens:
+                return False
+        self.requests += 1
+        self.tokens += cost
+        return True
+
+    def release(self, cost: int) -> None:
+        self.requests -= 1
+        self.tokens -= cost
+        waiters, self._waiters = self._waiters, []
+        for fut in waiters:
+            if not fut.done():
+                fut.set_result(None)
+
+    async def wait_release_or(self, event: asyncio.Event) -> None:
+        """Return after the next release, or once `event` is set."""
+        fut = asyncio.get_running_loop().create_future()
+        self._waiters.append(fut)
+        event_wait = asyncio.ensure_future(event.wait())
+        try:
+            await asyncio.wait({fut, event_wait}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            event_wait.cancel()
+            if fut in self._waiters:
+                self._waiters.remove(fut)
+
+
 class TeacherFollowGapError(RuntimeError):
     """Prefix cache hid rows this trajectory has not scored yet."""
 
