@@ -184,6 +184,8 @@ class PPOTrainerSync(PPOTrainer):
         ):
             if not 0 < float(sync_config.get(name, default)) <= 1:
                 raise ValueError(f"{name} must be in (0, 1]")
+        if int(sync_config.get("actor_rollout_overlap_min_samples", 0)) < 0:
+            raise ValueError("actor_rollout_overlap_min_samples must be nonnegative")
         logger.info("actor_rollout_overlap: accumulate scored trajectories before the Student barrier")
 
     def prepare_step(self) -> dict:
@@ -298,6 +300,10 @@ class PPOTrainerSync(PPOTrainer):
         student_threshold = math.ceil(
             sample_batch_size * float(sync_config.get("actor_rollout_overlap_student_fraction", 0.75))
         )
+        min_samples = int(sync_config.get("actor_rollout_overlap_min_samples", 0))
+        dp_size = self._actor_dp_size()
+        if min_samples % dp_size:
+            raise ValueError("actor_rollout_overlap_min_samples must be a multiple of Actor DP size")
         denominator = sample_batch_size * int(self.config.data.max_response_length)
         consumed: set[str] = set()
         chunks: list[dict] = []
@@ -330,10 +336,18 @@ class PPOTrainerSync(PPOTrainer):
                 start_ready = (
                     len(teacher_ready) >= teacher_threshold or len(students.keys) >= student_threshold
                 )
-                if not ready or (not started and not start_ready):
+                take = ready
+                if min_samples:
+                    # Only the last remainder may be short of a DP multiple.
+                    if len(ready) < remaining:
+                        take = ready[: len(ready) - len(ready) % dp_size]
+                        if len(take) < min_samples:
+                            take = []
+                elif not started and not start_ready:
+                    take = []
+                if not take:
                     time.sleep(self.replay_buffer.poll_interval)
                     continue
-                take = ready
                 take_n = len(take)
                 chunk = students.select_keys(take)
                 chunk.extra_info.update(self._actor_update_extra_info())

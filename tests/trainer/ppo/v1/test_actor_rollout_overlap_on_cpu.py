@@ -225,6 +225,40 @@ def test_overlap_waits_for_either_threshold_then_drains_every_ready_sample(
     assert order.count("begin") == order.count("finish") == 1
 
 
+@pytest.mark.parametrize(
+    "batch_size,min_samples,readiness,expected_chunks",
+    [
+        # Fewer than min_samples ready waits even past both fraction gates.
+        (8, 4, [(8, 3), (8, 5), (8, 7), (8, 8)], [4, 4]),
+        # A DP multiple is taken from the ready set; one sample stays behind.
+        (8, 2, [(5, 3), (8, 8)], [2, 6]),
+        (8, 2, [(8, 3), (8, 7), (8, 8)], [2, 4, 2]),
+        # The last remainder goes as soon as it is all ready, padded to DP.
+        (7, 2, [(7, 3), (7, 7)], [2, 5]),
+        (8, 6, [(8, 8)], [8]),
+    ],
+)
+def test_overlap_min_samples_replaces_fraction_gate(batch_size, min_samples, readiness, expected_chunks):
+    trainer = _trainer(batch_size=batch_size)
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = min_samples
+    order, trained = _wire_stream(trainer, readiness=readiness)
+    trainer._step_once({}, {}, batch_size)
+    events = trainer._trace_actor_chunk_events
+    assert [event["n"] for event in events] == expected_chunks
+    assert all(event["n"] % 2 == 0 for event in events[:-1])
+    assert len(trained) == len(set(trained)) == batch_size
+    assert order.count("begin") == order.count("finish") == 1
+
+
+def test_overlap_rejects_min_samples_off_dp_before_actor_begin():
+    trainer = _trainer()
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = 3
+    order, _ = _wire_stream(trainer)
+    with pytest.raises(ValueError, match="multiple of Actor DP"):
+        trainer._step_once({}, {}, 5)
+    assert order == []
+
+
 def test_overlap_restores_poll_when_sample_begin_fails():
     trainer = _trainer()
     order, _ = _wire_stream(trainer)

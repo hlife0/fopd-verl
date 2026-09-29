@@ -255,6 +255,11 @@ trainer:
       actor_rollout_overlap_teacher_fraction: 0.5
       actor_rollout_overlap_student_fraction: 0.75
 
+      # 0 keeps the fraction gate above. A positive multiple of Actor DP size
+      # replaces it: every F/B waits for at least this many new ready samples and
+      # takes the largest DP multiple of them; the last remainder goes once all ready.
+      actor_rollout_overlap_min_samples: 0
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 
