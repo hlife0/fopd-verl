@@ -250,6 +250,17 @@ def test_overlap_min_samples_replaces_fraction_gate(batch_size, min_samples, rea
     assert order.count("begin") == order.count("finish") == 1
 
 
+def test_overlap_green_sms_only_while_students_run():
+    trainer = _trainer(batch_size=8)
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = 2
+    trainer.config.trainer.v1.sync.actor_rollout_overlap_green_sms = 40
+    _wire_stream(trainer, readiness=[(5, 3), (7, 5), (8, 8)])
+    trainer._step_once({}, {}, 8)
+    events = trainer._trace_actor_chunk_events
+    assert [event["n"] for event in events] == [2, 2, 4]
+    assert [event["green_sms"] for event in events] == [40, 40, 0]
+
+
 def test_overlap_rejects_min_samples_off_dp_before_actor_begin():
     trainer = _trainer()
     trainer.config.trainer.v1.sync.actor_rollout_overlap_min_samples = 3

@@ -38,6 +38,7 @@ from verl.trainer.distillation import distillation_ppo_loss, is_distillation_ena
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.green_context import green_sms
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -468,8 +469,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             tu.assign_non_tensor(data, batch_num_tokens_override=self._held_loss_normalization_tokens)
             chunk_loss_tokens = data["loss_mask"].sum().detach().to(self._held_loss_tokens)
         global_token_num = self._global_token_num(data)
+        # Set by colocated overlap while Student rollout still runs on these GPUs.
+        green = int(tu.get(data, key="actor_green_sms", default=0) or 0)
         chunk_fb_start_ts = time.time()
-        with Timer(name="train_batch", logger=None) as timer:
+        with Timer(name="train_batch", logger=None) as timer, green_sms(green):
             output = self.engine.forward_backward_batch(data, loss_function=self.loss_fn, forward_only=False)
         chunk_fb_end_ts = time.time()
         if self._held_loss_normalization_tokens is not None:
@@ -484,6 +487,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 images_seqlens=tu.get(data, key="images_seqlens", default=None),
             ).cpu()
             tu.get(processed, "metrics").update(
+                chunk_green_sms=green,
                 chunk_fb_s=timer.last,
                 chunk_fb_start_ts=chunk_fb_start_ts,
                 chunk_fb_end_ts=chunk_fb_end_ts,

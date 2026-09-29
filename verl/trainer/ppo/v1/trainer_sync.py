@@ -186,6 +186,8 @@ class PPOTrainerSync(PPOTrainer):
                 raise ValueError(f"{name} must be in (0, 1]")
         if int(sync_config.get("actor_rollout_overlap_min_samples", 0)) < 0:
             raise ValueError("actor_rollout_overlap_min_samples must be nonnegative")
+        if int(sync_config.get("actor_rollout_overlap_green_sms", 0)) < 0:
+            raise ValueError("actor_rollout_overlap_green_sms must be nonnegative")
         logger.info("actor_rollout_overlap: accumulate scored trajectories before the Student barrier")
 
     def prepare_step(self) -> dict:
@@ -301,6 +303,7 @@ class PPOTrainerSync(PPOTrainer):
             sample_batch_size * float(sync_config.get("actor_rollout_overlap_student_fraction", 0.75))
         )
         min_samples = int(sync_config.get("actor_rollout_overlap_min_samples", 0))
+        green_sms = int(sync_config.get("actor_rollout_overlap_green_sms", 0))
         dp_size = self._actor_dp_size()
         if min_samples % dp_size:
             raise ValueError("actor_rollout_overlap_min_samples must be a multiple of Actor DP size")
@@ -351,6 +354,8 @@ class PPOTrainerSync(PPOTrainer):
                 take_n = len(take)
                 chunk = students.select_keys(take)
                 chunk.extra_info.update(self._actor_update_extra_info())
+                rollout_running = len(students.keys) < sample_batch_size
+                chunk.extra_info["actor_green_sms"] = green_sms if rollout_running else 0
                 chunk = self._balance_batch(
                     chunk, metrics=metrics, logging_prefix="early_actor_chunk", align_to_mini_batch=False
                 )
@@ -376,6 +381,7 @@ class PPOTrainerSync(PPOTrainer):
                         "return_ts": return_ts,
                         "chunk_fb_s": _chunk_fb_s(output),
                         "students_done_when_dispatched": len(students.keys),
+                        "green_sms": chunk.extra_info["actor_green_sms"],
                         "chunk_fb_start_ts": _chunk_metric(output, "chunk_fb_start_ts"),
                         "chunk_fb_end_ts": _chunk_metric(output, "chunk_fb_end_ts"),
                     }

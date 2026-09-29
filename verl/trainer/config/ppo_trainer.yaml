@@ -260,6 +260,10 @@ trainer:
       # takes the largest DP multiple of them; the last remainder goes once all ready.
       actor_rollout_overlap_min_samples: 0
 
+      # Actor F/B dispatched while Student rollout still runs uses a CUDA green
+      # context of this many SMs; later F/B and the update use the whole GPU. 0 is off.
+      actor_rollout_overlap_green_sms: 0
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 
