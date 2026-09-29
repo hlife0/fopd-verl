@@ -357,7 +357,8 @@ class AsyncTeacherLLMServerManager:
         request_id: str,
         routing_key: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        """Follow one Student sequence: at most one in-flight Teacher request.
+        """Follow one Student sequence: at most one in-flight Teacher request
+        (two while a final request overtakes a mid hop).
 
         Idle signal is this sequence's previous Teacher request finishing.
         Mid-follow payload is the current prefix cut to whole KV blocks plus one
