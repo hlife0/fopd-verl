@@ -346,6 +346,7 @@ class StudentTokenState:
         self.student_done = False
         self.event = asyncio.Event()
         self.ready = asyncio.Event()
+        self.done = asyncio.Event()
         self.loop = asyncio.get_running_loop()
 
     def set_prompt(
@@ -377,6 +378,7 @@ class StudentTokenState:
 
     def mark_done(self) -> None:
         self.student_done = True
+        self.done.set()
         self.event.set()
 
     def snapshot(self) -> list[int]:

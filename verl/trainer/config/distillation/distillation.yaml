@@ -26,6 +26,9 @@ teacher_follow_priority: false
 # finished sequences are never held back.
 teacher_follow_mid_max_requests: 0
 teacher_follow_mid_max_tokens: 0
+# With follow on: a finished sequence sends its final Teacher request without
+# waiting for its in-flight mid-follow request to return.
+teacher_follow_final_overtakes_mid: false
 
 # distillation loss config
 distillation_loss:

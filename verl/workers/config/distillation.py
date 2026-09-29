@@ -243,6 +243,10 @@ class DistillationConfig(BaseConfig):
         Student sequences are never held back.
     teacher_follow_mid_max_tokens (int):
         Same, as a cap on the new tokens those mid-follow requests carry.
+    teacher_follow_final_overtakes_mid (bool):
+        When follow is on and a Student sequence finishes while its mid-follow
+        request is still at the Teacher, send the final request at once instead
+        of after that request returns.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -284,6 +288,7 @@ class DistillationConfig(BaseConfig):
     teacher_follow_priority: bool = False
     teacher_follow_mid_max_requests: int = 0
     teacher_follow_mid_max_tokens: int = 0
+    teacher_follow_final_overtakes_mid: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)

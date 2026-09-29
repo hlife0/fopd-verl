@@ -310,7 +310,9 @@ def _run_follow_with_recorded_priorities(prioritize_done: bool) -> tuple[list[tu
             return SimpleNamespace(extra_fields=extra)
 
     manager = object.__new__(AsyncTeacherLLMServerManager)
-    manager.distillation_config = SimpleNamespace(teacher_follow_priority=prioritize_done)
+    manager.distillation_config = SimpleNamespace(
+        teacher_follow_priority=prioritize_done, teacher_follow_final_overtakes_mid=False
+    )
     manager.distillation_loss_config = SimpleNamespace(topk=0, loss_settings=SimpleNamespace(use_topk=False))
     manager.teacher_model_configs = {"t": SimpleNamespace(inference=SimpleNamespace(temperature=1.0))}
     manager.teacher_client = {"t": FakeClient()}
@@ -430,13 +432,17 @@ def test_make_follow_mid_gate_splits_over_workers():
 
 
 class _CachingTeacher:
-    """Fake Teacher with a block prefix cache; each request waits until released."""
+    """Fake Teacher with a block prefix cache; each request waits until released.
+
+    compute() runs a pending request (reads and fills the cache) without
+    returning it yet, like a hop whose step finished before its reply arrives.
+    """
 
     def __init__(self, width: int, block: int = 16):
         self.width = width
         self.block = block
         self.cached: set[tuple[int, ...]] = set()
-        self.pending: list[tuple[str, int, int, Any]] = []
+        self.pending: dict[str, list] = {}
         self.calls: list[tuple[str, int, int]] = []
 
     def _num_cached(self, prompt_ids: list[int]) -> int:
@@ -449,52 +455,80 @@ class _CachingTeacher:
         import asyncio
         from types import SimpleNamespace
 
-        event = asyncio.Event()
+        entry = [list(prompt_ids), asyncio.Event(), None]
         self.calls.append((request_id, len(prompt_ids), priority))
-        self.pending.append((request_id, len(prompt_ids), priority, event))
-        await event.wait()
+        self.pending.setdefault(request_id, []).append(entry)
+        await entry[1].wait()
+        return SimpleNamespace(extra_fields=entry[2])
+
+    def _entry(self, request_id: str, payload_len: int):
+        for entry in self.pending.get(request_id, []):
+            if len(entry[0]) == payload_len:
+                return entry
+        raise AssertionError(f"no pending request {request_id}/{payload_len}")
+
+    def compute(self, request_id: str, payload_len: int) -> None:
+        entry = self._entry(request_id, payload_len)
+        if entry[2] is not None:
+            return
+        prompt_ids = entry[0]
         n = len(prompt_ids)
         cached = self._num_cached(prompt_ids)
         ids, lps = _oneshot_rows(n + 1, self.width)
         for k in range(self.block, n + 1, self.block):
             self.cached.add(tuple(prompt_ids[:k]))
-        extra = {
+        entry[2] = {
             "prompt_ids": ids[cached : n - 1] + [[0] * self.width],
             "prompt_logprobs": lps[cached : n - 1] + [[0.0] * self.width],
             "num_cached_tokens": cached,
             "decode_topk_ids": ids[n - 1],
             "decode_topk_logprobs": lps[n - 1],
         }
-        return SimpleNamespace(extra_fields=extra)
 
-    def release(self, request_id: str) -> tuple[int, int]:
-        for i, (rid, n, priority, event) in enumerate(self.pending):
-            if rid == request_id:
-                del self.pending[i]
-                event.set()
-                return n, priority
-        raise AssertionError(f"no pending request {request_id}")
+    def release(self, request_id: str, payload_len: int) -> None:
+        self.compute(request_id, payload_len)
+        entry = self._entry(request_id, payload_len)
+        self.pending[request_id].remove(entry)
+        entry[1].set()
+
+
+def _follow_manager(teacher, *, width: int, gate=None, overtake: bool = False):
+    from types import SimpleNamespace
+
+    from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_config = SimpleNamespace(
+        teacher_follow_priority=True, teacher_follow_final_overtakes_mid=overtake
+    )
+    manager.distillation_loss_config = SimpleNamespace(topk=width, loss_settings=SimpleNamespace(use_topk=True))
+    manager.teacher_model_configs = {"t": SimpleNamespace(inference=SimpleNamespace(temperature=1.0))}
+    manager.teacher_client = {"t": teacher}
+    manager.follow_mid_gate = gate
+    return manager
+
+
+async def _settle():
+    import asyncio
+
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+def _assert_matches_oneshot(ids, lps, seq_len: int, width: int) -> None:
+    want_ids, want_lps = _oneshot_rows(seq_len, width)
+    ok, msg = teacher_topk_equivalent(ids, lps, torch.tensor(want_ids), torch.tensor(want_lps))
+    assert ok, msg
 
 
 def test_follow_mid_gate_holds_mid_hops_but_not_finished_requests():
     import asyncio
-    from types import SimpleNamespace
 
     from verl.experimental.teacher_loop.teacher_follow import FollowMidGate, StudentTokenState
-    from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
     width = 2
     teacher = _CachingTeacher(width)
-    manager = object.__new__(AsyncTeacherLLMServerManager)
-    manager.distillation_config = SimpleNamespace(teacher_follow_priority=True)
-    manager.distillation_loss_config = SimpleNamespace(topk=width, loss_settings=SimpleNamespace(use_topk=True))
-    manager.teacher_model_configs = {"t": SimpleNamespace(inference=SimpleNamespace(temperature=1.0))}
-    manager.teacher_client = {"t": teacher}
-    manager.follow_mid_gate = FollowMidGate(max_requests=1)
-
-    async def _settle():
-        for _ in range(20):
-            await asyncio.sleep(0)
+    manager = _follow_manager(teacher, width=width, gate=FollowMidGate(max_requests=1))
 
     async def _run():
         a, b = StudentTokenState(), StudentTokenState()
@@ -511,23 +545,84 @@ def test_follow_mid_gate_holds_mid_hops_but_not_finished_requests():
         b.mark_done()
         await _settle()
         assert teacher.calls == [("a", 32, 1), ("b", 40, 0)]
-        teacher.release("b")
+        teacher.release("b", 40)
         ids_b, lps_b, _ = await asyncio.wait_for(task_b, 1.0)
         # A keeps decoding; its next hop waits for its own in-flight hop, then reuses the cache.
         a.update_response(list(range(100, 148)))
-        teacher.release("a")
+        teacher.release("a", 32)
         await _settle()
         assert teacher.calls[-1] == ("a", 48, 1)
         a.mark_done()
-        teacher.release("a")
+        teacher.release("a", 48)
         await _settle()
         assert teacher.calls[-1] == ("a", 56, 0)
-        teacher.release("a")
+        teacher.release("a", 56)
         ids_a, lps_a, _ = await asyncio.wait_for(task_a, 1.0)
         assert (manager.follow_mid_gate.requests, manager.follow_mid_gate.tokens) == (0, 0)
         return (ids_a, lps_a, 56), (ids_b, lps_b, 40)
 
-    for got_ids, got_lps, seq_len in asyncio.run(_run()):
-        want_ids, want_lps = _oneshot_rows(seq_len, width)
-        ok, msg = teacher_topk_equivalent(got_ids, got_lps, torch.tensor(want_ids), torch.tensor(want_lps))
-        assert ok, msg
+    for ids, lps, seq_len in asyncio.run(_run()):
+        _assert_matches_oneshot(ids, lps, seq_len, width)
+
+
+def _run_finish_during_hop(overtake: bool, hop_computed_first: bool):
+    import asyncio
+    import json
+
+    from verl.experimental.teacher_loop.teacher_follow import StudentTokenState
+
+    width = 2
+    teacher = _CachingTeacher(width)
+    manager = _follow_manager(teacher, width=width, overtake=overtake)
+
+    async def _run():
+        state = StudentTokenState()
+        state.set_prompt(list(range(8)))
+        state.update_response(list(range(100, 124)))
+        task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="r"))
+        await _settle()
+        teacher.release("r", 32)
+        state.update_response(list(range(100, 140)))
+        await _settle()
+        assert teacher.calls[-1] == ("r", 48, 1)
+        if hop_computed_first:
+            teacher.compute("r", 48)
+        state.update_response(list(range(100, 145)))
+        state.mark_done()
+        await _settle()
+        if not overtake:
+            # The final request waits for the in-flight hop.
+            assert teacher.calls[-1] == ("r", 48, 1)
+            teacher.release("r", 48)
+            await _settle()
+        assert teacher.calls[-1] == ("r", 53, 0)
+        teacher.release("r", 53)
+        await _settle()
+        if overtake and hop_computed_first:
+            # The final request read the hop's blocks, so it waits for the hop's rows.
+            assert not task.done()
+            teacher.release("r", 48)
+        ids, lps, extra = await asyncio.wait_for(task, 1.0)
+        return ids, lps, json.loads(extra["teacher_requests"])
+
+    ids, lps, rows = asyncio.run(_run())
+    _assert_matches_oneshot(ids, lps, 53, width)
+    return teacher, rows
+
+
+def test_follow_final_waits_for_hop_without_overtake():
+    _, rows = _run_finish_during_hop(overtake=False, hop_computed_first=False)
+    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(32, False), (48, False), (53, False)]
+
+
+def test_follow_final_overtakes_queued_hop_and_drops_it():
+    teacher, rows = _run_finish_during_hop(overtake=True, hop_computed_first=False)
+    # The final request recomputed from the stitched prefix, so the hop was dropped.
+    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(32, False), (48, True), (53, False)]
+    assert rows[-1]["num_cached"] == 32
+
+
+def test_follow_final_overtakes_computed_hop_and_stitches_it_first():
+    _, rows = _run_finish_during_hop(overtake=True, hop_computed_first=True)
+    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(32, False), (48, False), (53, False)]
+    assert rows[-1]["num_cached"] == 48

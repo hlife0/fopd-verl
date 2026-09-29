@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import logging
 import os
@@ -322,6 +323,30 @@ class AsyncTeacherLLMServerManager:
             )
         return 1
 
+    async def _follow_forward(
+        self,
+        payload: list[int],
+        request_id: str,
+        routing_key: Optional[str],
+        state: StudentTokenState,
+        priority: int,
+        gate_cost: int = 0,
+    ) -> dict:
+        """One follow request; frees its mid-follow gate slot when it returns or is cancelled."""
+        try:
+            return await self._teacher_forward(
+                payload,
+                request_id=request_id,
+                follow=True,
+                multi_modal_data=state.multi_modal_data,
+                mm_processor_kwargs=state.mm_processor_kwargs,
+                routing_key=routing_key,
+                priority=priority,
+            )
+        finally:
+            if gate_cost:
+                self.follow_mid_gate.release(gate_cost)
+
     async def compute_teacher_logprobs_follow(
         self,
         state: StudentTokenState,
@@ -345,8 +370,42 @@ class AsyncTeacherLLMServerManager:
         request_log: list[dict[str, Any]] = []
 
         prioritize_done = self.distillation_config.teacher_follow_priority
+        overtake = self.distillation_config.teacher_follow_final_overtakes_mid
         gate = self.follow_mid_gate
         gate_wait_since = None
+
+        def _record(seq_len, payload_len, scored_before, extra, submit_ts, priority, gate_wait_s, extra_calls):
+            nonlocal num_requests, last_cached, last_prefill_s, first_prefill_s, extra_out
+            # extra is None for a mid hop dropped because the final request overtook it.
+            num_requests += 1 + extra_calls
+            row = {
+                "seq_len": int(seq_len),
+                "payload_len": int(payload_len),
+                "new_tokens": int(payload_len - scored_before),
+                "scored_before": int(scored_before),
+                "num_cached": None if extra is None else int(extra.get("num_cached_tokens") or 0),
+                "prefill_s": None if extra is None else extra.get("engine_prefill_s"),
+                "submit_ts": submit_ts,
+                "student_done": bool(state.student_done),
+                "priority": int(priority),
+                "gate_wait_s": gate_wait_s,
+                "overtaken": extra is None,
+                "hole_fills": int(extra_calls),
+            }
+            request_log.append(row)
+            _follow_cache_log = os.environ.get("FOPD_FOLLOW_CACHE_LOG")
+            if _follow_cache_log:
+                with open(_follow_cache_log, "a", encoding="utf-8") as _fh:
+                    _fh.write(json.dumps({"request_id": request_id, "n": num_requests, **row}) + "\n")
+            if extra is None:
+                return
+            last_cached = row["num_cached"]
+            last_prefill_s = row["prefill_s"]
+            if first_prefill_s is None:
+                first_prefill_s = last_prefill_s
+            extra_out = extra
+            copy_teacher_engine_timings(extra_out, extra)
+
         while True:
             seq = state.snapshot()
             student_done = state.student_done
@@ -371,56 +430,57 @@ class AsyncTeacherLLMServerManager:
                 gate_wait_s = submit_ts - gate_wait_since if gate_wait_since is not None else 0.0
                 gate_wait_since = None
                 payload = seq[:submit_len]
+                hop = asyncio.ensure_future(
+                    self._follow_forward(payload, request_id, routing_key, state, priority, gate_cost)
+                )
+                final_seq = None
+                done_wait = None
                 try:
-                    extra = await self._teacher_forward(
-                        payload,
-                        request_id=request_id,
-                        follow=True,
-                        multi_modal_data=state.multi_modal_data,
-                        mm_processor_kwargs=state.mm_processor_kwargs,
-                        routing_key=routing_key,
-                        priority=priority,
-                    )
+                    if overtake and not student_done:
+                        done_wait = asyncio.ensure_future(state.done.wait())
+                        await asyncio.wait({hop, done_wait}, return_when=asyncio.FIRST_COMPLETED)
+                    if not hop.done() and state.student_done and overtake:
+                        # Student finished while this mid hop is in flight: send the final
+                        # request now instead of after the hop returns.
+                        final_seq = state.snapshot()
+                        final_priority = follow_request_priority(True, prioritize_done)
+                        final_submit_ts = time.time()
+                        final_extra = await self._follow_forward(
+                            final_seq, request_id, routing_key, state, final_priority
+                        )
+                        if int(final_extra.get("num_cached_tokens") or 0) <= acc.scored_seq_len:
+                            # Its rows start at or before what is stitched: it covers the hop.
+                            hop.cancel()
+                            await asyncio.gather(hop, return_exceptions=True)
+                    extra = None if hop.cancelled() else await hop
+                finally:
+                    if done_wait is not None:
+                        done_wait.cancel()
+                    if not hop.done():
+                        hop.cancel()
+                extra_calls = 0
+                if extra is not None:
                     extra_calls = await self._apply_follow_extract(
                         acc, payload, extra, request_id, routing_key, state, priority
                     )
-                finally:
-                    if gate_cost:
-                        gate.release(gate_cost)
-                num_requests += 1 + extra_calls
-                last_cached = int(extra.get("num_cached_tokens") or 0)
-                last_prefill_s = extra.get("engine_prefill_s")
-                row = {
-                    "seq_len": len(seq),
-                    "payload_len": int(submit_len),
-                    "new_tokens": int(submit_len - scored_before),
-                    "scored_before": int(scored_before),
-                    "num_cached": last_cached,
-                    "prefill_s": last_prefill_s,
-                    "submit_ts": submit_ts,
-                    "student_done": bool(state.student_done),
-                    "priority": int(priority),
-                    "gate_wait_s": gate_wait_s,
-                    "hole_fills": int(extra_calls),
-                }
-                request_log.append(row)
-                _follow_cache_log = os.environ.get("FOPD_FOLLOW_CACHE_LOG")
-                if _follow_cache_log:
-                    with open(_follow_cache_log, "a", encoding="utf-8") as _fh:
-                        _fh.write(
-                            json.dumps(
-                                {
-                                    "request_id": request_id,
-                                    "n": num_requests,
-                                    **row,
-                                }
-                            )
-                            + "\n"
-                        )
-                if first_prefill_s is None:
-                    first_prefill_s = last_prefill_s
-                extra_out = extra
-                copy_teacher_engine_timings(extra_out, extra)
+                _record(len(seq), submit_len, scored_before, extra, submit_ts, priority, gate_wait_s, extra_calls)
+                if final_seq is not None:
+                    # Final rows go last: the hop was dropped, or its rows are stitched because
+                    # the final request read the blocks it computed.
+                    scored_before = acc.scored_seq_len
+                    extra_calls = await self._apply_follow_extract(
+                        acc, final_seq, final_extra, request_id, routing_key, state, final_priority
+                    )
+                    _record(
+                        len(final_seq),
+                        len(final_seq),
+                        scored_before,
+                        final_extra,
+                        final_submit_ts,
+                        final_priority,
+                        0.0,
+                        extra_calls,
+                    )
             elif state.student_done:
                 break
             else:
