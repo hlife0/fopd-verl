@@ -233,6 +233,10 @@ class DistillationConfig(BaseConfig):
         Floor for Teacher vLLM gpu_memory_utilization when follow is on.
         Follow keeps live prefixes in KV; the student-copied default is often
         too small. Ignored if the Teacher engine already sets a higher value.
+    teacher_follow_priority (bool):
+        When follow is on, run the Teacher vLLM with priority scheduling and
+        send mid-follow prefix requests at a lower priority than requests for
+        finished Student sequences, so finished samples are scored first.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -271,6 +275,7 @@ class DistillationConfig(BaseConfig):
     enabled: bool = False
     teacher_follow: bool = False
     teacher_follow_min_gpu_memory_utilization: float = 0.75
+    teacher_follow_priority: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)

@@ -277,3 +277,85 @@ def test_teacher_topk_equivalent_rejects_set_mismatch_with_same_top1():
     assert "top-k set" in msg
     report = teacher_alignment_report(ids_a, lps_a, ids_b, lps_b)
     assert report["shape_ok"] and report["top1_mismatch"] == 0 and report["set_mismatch"] == 1
+
+
+def test_follow_request_priority_puts_finished_first():
+    from verl.experimental.teacher_loop.teacher_follow import FOLLOW_MID_PRIORITY, follow_request_priority
+
+    assert FOLLOW_MID_PRIORITY > 0
+    assert follow_request_priority(student_done=False, prioritize_done=True) == FOLLOW_MID_PRIORITY
+    assert follow_request_priority(student_done=True, prioritize_done=True) == 0
+    assert follow_request_priority(student_done=False, prioritize_done=False) == 0
+    assert follow_request_priority(student_done=True, prioritize_done=False) == 0
+
+
+def _run_follow_with_recorded_priorities(prioritize_done: bool) -> tuple[list[tuple[int, int]], torch.Tensor]:
+    import asyncio
+    from types import SimpleNamespace
+
+    from verl.experimental.teacher_loop.teacher_follow import StudentTokenState
+    from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+    calls: list[tuple[int, int]] = []
+
+    class FakeClient:
+        async def generate(self, request_id, *, prompt_ids, sampling_params, priority=0, **kwargs):
+            calls.append((len(prompt_ids), priority))
+            ids, lps = _oneshot_rows(len(prompt_ids), 1)
+            extra = {
+                "prompt_ids": ids + [[0]],
+                "prompt_logprobs": lps + [[0.0]],
+                "num_cached_tokens": 0,
+            }
+            return SimpleNamespace(extra_fields=extra)
+
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_config = SimpleNamespace(teacher_follow_priority=prioritize_done)
+    manager.distillation_loss_config = SimpleNamespace(topk=0, loss_settings=SimpleNamespace(use_topk=False))
+    manager.teacher_model_configs = {"t": SimpleNamespace(inference=SimpleNamespace(temperature=1.0))}
+    manager.teacher_client = {"t": FakeClient()}
+
+    async def _run():
+        state = StudentTokenState()
+        state.set_prompt(list(range(8)))
+        state.update_response(list(range(100, 116)))
+        task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="r"))
+        while not calls:
+            await asyncio.sleep(0)
+        # Let the mid-follow hop return, then finish the Student sequence.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        state.mark_done()
+        teacher_ids, _, _ = await task
+        return teacher_ids
+
+    teacher_ids = asyncio.run(_run())
+    return calls, teacher_ids
+
+
+def test_follow_loop_sends_mid_hops_at_lower_priority_when_enabled():
+    calls, teacher_ids = _run_follow_with_recorded_priorities(prioritize_done=True)
+    # 24 tokens: the mid hop sends the block-aligned 16, the final request the full 24.
+    assert calls == [(16, 1), (24, 0)]
+    assert teacher_ids.shape[0] == 24
+
+    calls, teacher_ids = _run_follow_with_recorded_priorities(prioritize_done=False)
+    assert calls == [(16, 0), (24, 0)]
+    assert teacher_ids.shape[0] == 24
+
+
+def test_configure_teacher_follow_replicas_sets_priority_policy():
+    from types import SimpleNamespace
+
+    from verl.experimental.teacher_loop.teacher_model import _configure_teacher_follow_replicas
+
+    def _configure(prioritize_done: bool) -> dict:
+        rollout_config = SimpleNamespace(engine_kwargs={}, gpu_memory_utilization=0.9)
+        distillation_config = SimpleNamespace(
+            teacher_follow_min_gpu_memory_utilization=0.75, teacher_follow_priority=prioritize_done
+        )
+        _configure_teacher_follow_replicas([SimpleNamespace()], rollout_config, distillation_config)
+        return rollout_config.engine_kwargs["vllm"]
+
+    assert _configure(True)["scheduling_policy"] == "priority"
+    assert "scheduling_policy" not in _configure(False)

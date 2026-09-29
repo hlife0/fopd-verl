@@ -34,6 +34,12 @@ import torch
 # floor(seq_len / block) * block so each hop ends on a full block.
 FOLLOW_KV_BLOCK_SIZE = 16
 
+# vLLM priority scheduling serves smaller values first. With
+# distillation.teacher_follow_priority, mid-follow hops take this value and
+# requests for finished Student sequences keep the default 0, so a finished
+# sample is scored before prefixes of sequences that are still decoding.
+FOLLOW_MID_PRIORITY = 1
+
 # Follow-only fields written onto extra_fields / TransferQueue tags.
 TEACHER_FOLLOW_TRACE_KEYS = (
     "teacher_num_requests",
@@ -163,6 +169,13 @@ def should_submit_follow(
 
 
 _should_submit_follow = should_submit_follow
+
+
+def follow_request_priority(student_done: bool, prioritize_done: bool) -> int:
+    """vLLM priority for a follow request: finished sequences go first when enabled."""
+    if prioritize_done and not student_done:
+        return FOLLOW_MID_PRIORITY
+    return 0
 
 
 class TeacherFollowGapError(RuntimeError):

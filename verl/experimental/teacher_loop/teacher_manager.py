@@ -29,6 +29,7 @@ from verl.experimental.teacher_loop.teacher_follow import (
     _should_submit_follow,
     _valid_teacher_rows,
     copy_teacher_engine_timings,
+    follow_request_priority,
     follow_submit_len,
     should_submit_follow,
     unpack_teacher_extract,
@@ -179,6 +180,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
+        priority: int = 0,
     ) -> dict:
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
@@ -198,6 +200,7 @@ class AsyncTeacherLLMServerManager:
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=mm_processor_kwargs,
+            priority=priority,
         )
         extra = teacher_output.extra_fields
         if not follow:
@@ -236,6 +239,7 @@ class AsyncTeacherLLMServerManager:
         request_id: str,
         routing_key: Optional[str],
         state: StudentTokenState,
+        priority: int = 0,
     ) -> None:
         """Recompute only the jumped prefix (shared-prompt / block-aligned cache)."""
         hole_end = min(max(compute_start, acc.filled_real + 1), len(seq))
@@ -248,6 +252,7 @@ class AsyncTeacherLLMServerManager:
             multi_modal_data=state.multi_modal_data,
             mm_processor_kwargs=state.mm_processor_kwargs,
             routing_key=routing_key,
+            priority=priority,
         )
         hole_ids, hole_lps, hole_dec_ids, hole_dec_lps, _ = unpack_teacher_extract(hole_extra)
         acc.apply(
@@ -267,6 +272,7 @@ class AsyncTeacherLLMServerManager:
         request_id: str,
         routing_key: Optional[str],
         state: StudentTokenState,
+        priority: int = 0,
     ) -> int:
         """Apply a follow extract. Returns 1 if a hole-fill request was issued."""
         extracted_ids, extracted_lps, decode_ids, decode_lps, num_cached = unpack_teacher_extract(extra)
@@ -281,7 +287,7 @@ class AsyncTeacherLLMServerManager:
             )
             return 0
         except TeacherFollowGapError as exc:
-            await self._fill_unscored_prefix(acc, seq, exc.compute_start, request_id, routing_key, state)
+            await self._fill_unscored_prefix(acc, seq, exc.compute_start, request_id, routing_key, state, priority)
         try:
             acc.apply(
                 seq_len=len(seq),
@@ -323,10 +329,13 @@ class AsyncTeacherLLMServerManager:
         last_prefill_s = None
         request_log: list[dict[str, Any]] = []
 
+        prioritize_done = self.distillation_config.teacher_follow_priority
         while True:
             seq = state.snapshot()
-            submit_len = follow_submit_len(len(seq), state.student_done, acc.scored_seq_len)
+            student_done = state.student_done
+            submit_len = follow_submit_len(len(seq), student_done, acc.scored_seq_len)
             if submit_len > acc.scored_seq_len:
+                priority = follow_request_priority(student_done, prioritize_done)
                 if teacher_start_ts is None:
                     teacher_start_ts = time.time()
                 scored_before = acc.scored_seq_len
@@ -339,8 +348,11 @@ class AsyncTeacherLLMServerManager:
                     multi_modal_data=state.multi_modal_data,
                     mm_processor_kwargs=state.mm_processor_kwargs,
                     routing_key=routing_key,
+                    priority=priority,
                 )
-                extra_calls = await self._apply_follow_extract(acc, payload, extra, request_id, routing_key, state)
+                extra_calls = await self._apply_follow_extract(
+                    acc, payload, extra, request_id, routing_key, state, priority
+                )
                 num_requests += 1 + extra_calls
                 last_cached = int(extra.get("num_cached_tokens") or 0)
                 last_prefill_s = extra.get("engine_prefill_s")
@@ -353,6 +365,7 @@ class AsyncTeacherLLMServerManager:
                     "prefill_s": last_prefill_s,
                     "submit_ts": submit_ts,
                     "student_done": bool(state.student_done),
+                    "priority": int(priority),
                     "hole_fills": int(extra_calls),
                 }
                 request_log.append(row)

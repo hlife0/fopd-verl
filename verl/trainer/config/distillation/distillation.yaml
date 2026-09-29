@@ -18,6 +18,9 @@ enabled: false
 teacher_follow: false
 # KV floor for Teacher vLLM when follow is on. Override per-engine if needed.
 teacher_follow_min_gpu_memory_utilization: 0.75
+# With follow on: Teacher vLLM uses priority scheduling and scores finished
+# sequences before prefixes of sequences that are still decoding.
+teacher_follow_priority: false
 
 # distillation loss config
 distillation_loss:
