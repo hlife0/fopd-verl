@@ -257,9 +257,13 @@ class AsyncTeacherLLMServerManager:
         state: StudentTokenState,
         priority: int = 0,
     ) -> None:
-        """Recompute only the jumped prefix (shared-prompt / block-aligned cache)."""
+        """Recompute only the jumped prefix (shared-prompt / block-aligned cache).
+
+        The hole request runs one token past the hole so its own dummy last row
+        lands where the retried extract starts and is overwritten by a real row.
+        """
         hole_end = min(max(compute_start, acc.filled_real + 1), len(seq))
-        hole_seq = seq[:hole_end]
+        hole_seq = seq[: min(hole_end + 1, len(seq))]
         hole_extra = await self._teacher_forward(
             hole_seq,
             request_id=request_id,
@@ -356,8 +360,9 @@ class AsyncTeacherLLMServerManager:
         """Follow one Student sequence: at most one in-flight Teacher request.
 
         Idle signal is this sequence's previous Teacher request finishing.
-        Mid-follow payload is the current prefix floored to a KV block; the last
-        request after Student finishes is the full prefix. Compute is the suffix.
+        Mid-follow payload is the current prefix cut to whole KV blocks plus one
+        token; the last request after Student finishes is the full prefix. Compute
+        is the suffix.
         """
         await state.ready.wait()
         acc = TeacherFollowAccumulator(_teacher_topk_width(self.distillation_loss_config))

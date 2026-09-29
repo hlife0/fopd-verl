@@ -148,21 +148,22 @@ def test_accumulator_partial_cache_overwrites_overlap():
 
 
 def test_should_submit_follow_aligns_to_kv_block():
-    # Wait until the live prefix fills at least one KV block.
-    assert _should_submit_follow(10, student_done=False, scored_seq_len=0) is False
-    assert _should_submit_follow(16, student_done=False, scored_seq_len=0) is True
-    # scored=20, seq=30 → aligned 16, nothing new.
-    assert _should_submit_follow(10, student_done=False, scored_seq_len=20) is False
-    # scored=20, seq=32 → aligned 32.
-    assert _should_submit_follow(12, student_done=False, scored_seq_len=20) is True
-    # leftover 5 tokens stay until Student finishes.
-    assert _should_submit_follow(5, student_done=False, scored_seq_len=32) is False
-    assert _should_submit_follow(5, student_done=True, scored_seq_len=32) is True
-    assert _should_submit_follow(0, student_done=True, scored_seq_len=32) is False
-    assert follow_submit_len(45, student_done=False, scored_seq_len=0) == 32
-    assert follow_submit_len(48, student_done=False, scored_seq_len=32) == 48
-    assert follow_submit_len(53, student_done=False, scored_seq_len=48) == 0
-    assert follow_submit_len(53, student_done=True, scored_seq_len=48) == 53
+    # Mid hops send whole KV blocks plus one token; wait for one block and a token.
+    assert _should_submit_follow(16, student_done=False, scored_seq_len=0) is False
+    assert _should_submit_follow(17, student_done=False, scored_seq_len=0) is True
+    # scored=17, seq=32 → 17 again, nothing new.
+    assert _should_submit_follow(15, student_done=False, scored_seq_len=17) is False
+    # scored=17, seq=33 → 33.
+    assert _should_submit_follow(16, student_done=False, scored_seq_len=17) is True
+    # leftover tokens stay until Student finishes.
+    assert _should_submit_follow(5, student_done=False, scored_seq_len=33) is False
+    assert _should_submit_follow(5, student_done=True, scored_seq_len=33) is True
+    assert _should_submit_follow(0, student_done=True, scored_seq_len=33) is False
+    assert follow_submit_len(45, student_done=False, scored_seq_len=0) == 33
+    assert follow_submit_len(49, student_done=False, scored_seq_len=33) == 49
+    assert follow_submit_len(48, student_done=False, scored_seq_len=33) == 0
+    assert follow_submit_len(53, student_done=False, scored_seq_len=49) == 0
+    assert follow_submit_len(53, student_done=True, scored_seq_len=49) == 53
 
 
 def test_follow_sampling_params_enable_prefix_read():
@@ -338,12 +339,12 @@ def _run_follow_with_recorded_priorities(prioritize_done: bool) -> tuple[list[tu
 
 def test_follow_loop_sends_mid_hops_at_lower_priority_when_enabled():
     calls, teacher_ids = _run_follow_with_recorded_priorities(prioritize_done=True)
-    # 24 tokens: the mid hop sends the block-aligned 16, the final request the full 24.
-    assert calls == [(16, 1), (24, 0)]
+    # 24 tokens: the mid hop sends one block plus a token, the final request the full 24.
+    assert calls == [(17, 1), (24, 0)]
     assert teacher_ids.shape[0] == 24
 
     calls, teacher_ids = _run_follow_with_recorded_priorities(prioritize_done=False)
-    assert calls == [(16, 0), (24, 0)]
+    assert calls == [(17, 0), (24, 0)]
     assert teacher_ids.shape[0] == 24
 
 
@@ -481,8 +482,10 @@ class _CachingTeacher:
             "prompt_ids": ids[cached : n - 1] + [[0] * self.width],
             "prompt_logprobs": lps[cached : n - 1] + [[0.0] * self.width],
             "num_cached_tokens": cached,
-            "decode_topk_ids": ids[n - 1],
-            "decode_topk_logprobs": lps[n - 1],
+            # Like the k1 Teacher, the decode row is the Teacher's own top token,
+            # not a score of the Student's next token, so follow must not use it.
+            "decode_topk_ids": [7] * self.width,
+            "decode_topk_logprobs": [99.0] * self.width,
         }
 
     def release(self, request_id: str, payload_len: int) -> None:
@@ -539,21 +542,21 @@ def test_follow_mid_gate_holds_mid_hops_but_not_finished_requests():
         task_a = asyncio.create_task(manager.compute_teacher_logprobs_follow(a, request_id="a"))
         task_b = asyncio.create_task(manager.compute_teacher_logprobs_follow(b, request_id="b"))
         await _settle()
-        # A's block-aligned mid hop holds the only slot; B's hop waits at the gate.
-        assert teacher.calls == [("a", 32, 1)]
+        # A's mid hop holds the only slot; B's hop waits at the gate.
+        assert teacher.calls == [("a", 33, 1)]
         # B finishes while A's hop is still in flight: its final request goes out at once.
         b.mark_done()
         await _settle()
-        assert teacher.calls == [("a", 32, 1), ("b", 40, 0)]
+        assert teacher.calls == [("a", 33, 1), ("b", 40, 0)]
         teacher.release("b", 40)
         ids_b, lps_b, _ = await asyncio.wait_for(task_b, 1.0)
         # A keeps decoding; its next hop waits for its own in-flight hop, then reuses the cache.
         a.update_response(list(range(100, 148)))
-        teacher.release("a", 32)
+        teacher.release("a", 33)
         await _settle()
-        assert teacher.calls[-1] == ("a", 48, 1)
+        assert teacher.calls[-1] == ("a", 49, 1)
         a.mark_done()
-        teacher.release("a", 48)
+        teacher.release("a", 49)
         await _settle()
         assert teacher.calls[-1] == ("a", 56, 0)
         teacher.release("a", 56)
@@ -581,19 +584,19 @@ def _run_finish_during_hop(overtake: bool, hop_computed_first: bool):
         state.update_response(list(range(100, 124)))
         task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="r"))
         await _settle()
-        teacher.release("r", 32)
-        state.update_response(list(range(100, 140)))
+        teacher.release("r", 17)
+        state.update_response(list(range(100, 141)))
         await _settle()
-        assert teacher.calls[-1] == ("r", 48, 1)
+        assert teacher.calls[-1] == ("r", 49, 1)
         if hop_computed_first:
-            teacher.compute("r", 48)
+            teacher.compute("r", 49)
         state.update_response(list(range(100, 145)))
         state.mark_done()
         await _settle()
         if not overtake:
             # The final request waits for the in-flight hop.
-            assert teacher.calls[-1] == ("r", 48, 1)
-            teacher.release("r", 48)
+            assert teacher.calls[-1] == ("r", 49, 1)
+            teacher.release("r", 49)
             await _settle()
         assert teacher.calls[-1] == ("r", 53, 0)
         teacher.release("r", 53)
@@ -601,7 +604,7 @@ def _run_finish_during_hop(overtake: bool, hop_computed_first: bool):
         if overtake and hop_computed_first:
             # The final request read the hop's blocks, so it waits for the hop's rows.
             assert not task.done()
-            teacher.release("r", 48)
+            teacher.release("r", 49)
         ids, lps, extra = await asyncio.wait_for(task, 1.0)
         return ids, lps, json.loads(extra["teacher_requests"])
 
@@ -612,17 +615,50 @@ def _run_finish_during_hop(overtake: bool, hop_computed_first: bool):
 
 def test_follow_final_waits_for_hop_without_overtake():
     _, rows = _run_finish_during_hop(overtake=False, hop_computed_first=False)
-    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(32, False), (48, False), (53, False)]
+    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(17, False), (49, False), (53, False)]
 
 
 def test_follow_final_overtakes_queued_hop_and_drops_it():
     teacher, rows = _run_finish_during_hop(overtake=True, hop_computed_first=False)
     # The final request recomputed from the stitched prefix, so the hop was dropped.
-    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(32, False), (48, True), (53, False)]
-    assert rows[-1]["num_cached"] == 32
+    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(17, False), (49, True), (53, False)]
+    assert rows[-1]["num_cached"] == 16
 
 
 def test_follow_final_overtakes_computed_hop_and_stitches_it_first():
     _, rows = _run_finish_during_hop(overtake=True, hop_computed_first=True)
-    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(32, False), (48, False), (53, False)]
+    assert [(r["payload_len"], r["overtaken"]) for r in rows] == [(17, False), (49, False), (53, False)]
     assert rows[-1]["num_cached"] == 48
+
+
+def test_follow_matches_oneshot_without_using_decode_rows():
+    import asyncio
+
+    from verl.experimental.teacher_loop.teacher_follow import StudentTokenState
+
+    width = 1
+    teacher = _CachingTeacher(width)
+    manager = _follow_manager(teacher, width=width)
+
+    async def _run():
+        state = StudentTokenState()
+        state.set_prompt(list(range(20)))
+        task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="r"))
+        for n in range(7, 140, 7):
+            state.update_response(list(range(100, 100 + n)))
+            await _settle()
+            for entry in list(teacher.pending.get("r", [])):
+                teacher.release("r", len(entry[0]))
+            await _settle()
+        state.mark_done()
+        await _settle()
+        while not task.done():
+            for entry in list(teacher.pending.get("r", [])):
+                teacher.release("r", len(entry[0]))
+            await _settle()
+        return await task
+
+    ids, lps, _ = asyncio.run(_run())
+    # Several mid hops ran, each ending just past a block, and no row came from a decode row.
+    assert sum(1 for _, n, p in teacher.calls if p == 1) >= 5
+    _assert_matches_oneshot(ids, lps, 20 + 133, width)

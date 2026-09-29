@@ -30,8 +30,10 @@ from typing import Any, Optional
 
 import torch
 
-# vLLM prefix cache is stored in token blocks. Mid-follow requests send
-# floor(seq_len / block) * block so each hop ends on a full block.
+# vLLM prefix cache is stored in token blocks and only full blocks are reused.
+# Mid-follow requests send whole blocks plus one token: that token's block stays
+# partial and uncached, so the next request recomputes it and scores the dummy
+# last row of this request against the Student's actual next token.
 FOLLOW_KV_BLOCK_SIZE = 16
 
 # vLLM priority scheduling serves smaller values first. With
@@ -143,17 +145,18 @@ def follow_submit_len(
 ) -> int:
     """How many prefix tokens to send. 0 means wait.
 
-    While Student is decoding, drop the tail that does not fill a KV block.
-    After Student finishes, send the remaining full prefix (including that tail).
+    While Student is decoding, send whole KV blocks plus one token (see
+    FOLLOW_KV_BLOCK_SIZE); the rest waits. After Student finishes, send the
+    remaining full prefix.
     """
     if seq_len <= scored_seq_len:
         return 0
     if student_done:
         return seq_len
-    aligned = seq_len - (seq_len % block_size)
-    if aligned <= scored_seq_len:
+    blocks = (seq_len - 1) // block_size * block_size
+    if blocks == 0 or blocks + 1 <= scored_seq_len:
         return 0
-    return aligned
+    return blocks + 1
 
 
 def should_submit_follow(
