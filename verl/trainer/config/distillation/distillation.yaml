@@ -20,7 +20,7 @@ teacher_follow: false
 teacher_follow_min_gpu_memory_utilization: 0.75
 # With follow on: Teacher vLLM uses priority scheduling and scores finished
 # sequences before prefixes of sequences that are still decoding.
-teacher_follow_priority: false
+teacher_follow_priority: true
 # With follow on: cap mid-follow Teacher requests in flight, by count and by the
 # new tokens they carry (0 = no cap; split over AgentLoop workers). Requests for
 # finished sequences are never held back.
@@ -28,7 +28,13 @@ teacher_follow_mid_max_requests: 0
 teacher_follow_mid_max_tokens: 0
 # With follow on: a finished sequence sends its final Teacher request without
 # waiting for its in-flight mid-follow request to return.
-teacher_follow_final_overtakes_mid: false
+teacher_follow_final_overtakes_mid: true
+# With follow on: Teacher vLLM per-step token budget, so a finished sequence's
+# request runs in the next short step (0 = keep the Teacher engine setting).
+teacher_follow_max_num_batched_tokens: 2048
+# With follow on: false turns vLLM async scheduling off on the Teacher, so a
+# request arriving mid-step joins the next step (true = vLLM's own choice).
+teacher_follow_async_scheduling: false
 
 # distillation loss config
 distillation_loss:

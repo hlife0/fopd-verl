@@ -40,6 +40,8 @@ def _configure_teacher_follow_replicas(replicas, rollout_config, distillation_co
 
     teacher_follow_priority switches the Teacher engine to priority scheduling
     so requests for finished sequences can overtake queued mid-follow hops.
+    teacher_follow_max_num_batched_tokens and teacher_follow_async_scheduling
+    keep Teacher steps short, so such a request starts in the next step.
     """
     for replica in replicas:
         replica.teacher_follow = True
@@ -52,6 +54,19 @@ def _configure_teacher_follow_replicas(replicas, rollout_config, distillation_co
     vllm_ek = engine_kwargs.setdefault("vllm", {})
     if distillation_config.teacher_follow_priority:
         vllm_ek["scheduling_policy"] = "priority"
+    step_tokens = int(distillation_config.teacher_follow_max_num_batched_tokens or 0)
+    if step_tokens > 0:
+        configured = vllm_ek.get("max_num_batched_tokens") or getattr(rollout_config, "max_num_batched_tokens", None)
+        if configured is not None and int(configured) != step_tokens:
+            logger.warning(
+                "teacher_follow sets Teacher max_num_batched_tokens to %d (was %s); "
+                "set distillation.teacher_follow_max_num_batched_tokens=0 to keep the engine value.",
+                step_tokens,
+                configured,
+            )
+        vllm_ek["max_num_batched_tokens"] = step_tokens
+    if not distillation_config.teacher_follow_async_scheduling:
+        vllm_ek["async_scheduling"] = False
     current = float(vllm_ek.get("gpu_memory_utilization") or getattr(rollout_config, "gpu_memory_utilization", 0) or 0)
     if current < min_util:
         vllm_ek["gpu_memory_utilization"] = min_util

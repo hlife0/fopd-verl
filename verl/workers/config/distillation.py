@@ -247,6 +247,15 @@ class DistillationConfig(BaseConfig):
         When follow is on and a Student sequence finishes while its mid-follow
         request is still at the Teacher, send the final request at once instead
         of after that request returns.
+    teacher_follow_max_num_batched_tokens (int):
+        When follow is on, the Teacher vLLM per-step token budget. Small steps
+        let a finished sequence's request run in the next short step instead of
+        behind a large batch of mid-follow hops. Overrides the Teacher
+        inference max_num_batched_tokens; 0 keeps the engine's own setting.
+    teacher_follow_async_scheduling (bool):
+        When follow is on and this is false, turn vLLM async scheduling off on
+        the Teacher, so a request that arrives mid-step joins the next step
+        rather than the one after it. True leaves vLLM's own choice.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -285,10 +294,12 @@ class DistillationConfig(BaseConfig):
     enabled: bool = False
     teacher_follow: bool = False
     teacher_follow_min_gpu_memory_utilization: float = 0.75
-    teacher_follow_priority: bool = False
+    teacher_follow_priority: bool = True
     teacher_follow_mid_max_requests: int = 0
     teacher_follow_mid_max_tokens: int = 0
-    teacher_follow_final_overtakes_mid: bool = False
+    teacher_follow_final_overtakes_mid: bool = True
+    teacher_follow_max_num_batched_tokens: int = 2048
+    teacher_follow_async_scheduling: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)

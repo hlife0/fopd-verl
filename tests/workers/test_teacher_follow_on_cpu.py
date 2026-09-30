@@ -353,16 +353,35 @@ def test_configure_teacher_follow_replicas_sets_priority_policy():
 
     from verl.experimental.teacher_loop.teacher_model import _configure_teacher_follow_replicas
 
-    def _configure(prioritize_done: bool) -> dict:
-        rollout_config = SimpleNamespace(engine_kwargs={}, gpu_memory_utilization=0.9)
+    def _configure(prioritize_done: bool, step_tokens: int = 0, async_scheduling: bool = True) -> dict:
+        rollout_config = SimpleNamespace(engine_kwargs={}, gpu_memory_utilization=0.9, max_num_batched_tokens=8192)
         distillation_config = SimpleNamespace(
-            teacher_follow_min_gpu_memory_utilization=0.75, teacher_follow_priority=prioritize_done
+            teacher_follow_min_gpu_memory_utilization=0.75,
+            teacher_follow_priority=prioritize_done,
+            teacher_follow_max_num_batched_tokens=step_tokens,
+            teacher_follow_async_scheduling=async_scheduling,
         )
         _configure_teacher_follow_replicas([SimpleNamespace()], rollout_config, distillation_config)
         return rollout_config.engine_kwargs["vllm"]
 
     assert _configure(True)["scheduling_policy"] == "priority"
     assert "scheduling_policy" not in _configure(False)
+    assert _configure(True, step_tokens=2048)["max_num_batched_tokens"] == 2048
+    assert "max_num_batched_tokens" not in _configure(True, step_tokens=0)
+    assert _configure(True, async_scheduling=False)["async_scheduling"] is False
+    assert "async_scheduling" not in _configure(True, async_scheduling=True)
+
+
+def test_follow_defaults_are_the_measured_recommendation():
+    from verl.workers.config import DistillationConfig
+
+    cfg = DistillationConfig()
+    assert cfg.teacher_follow is False
+    assert cfg.teacher_follow_priority is True
+    assert cfg.teacher_follow_final_overtakes_mid is True
+    assert cfg.teacher_follow_max_num_batched_tokens == 2048
+    assert cfg.teacher_follow_async_scheduling is False
+    assert cfg.teacher_follow_mid_max_requests == 0 and cfg.teacher_follow_mid_max_tokens == 0
 
 
 def test_follow_mid_gate_caps_requests_and_tokens():
