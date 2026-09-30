@@ -372,15 +372,15 @@ def test_configure_teacher_follow_replicas_sets_priority_policy():
     assert "async_scheduling" not in _configure(True, async_scheduling=True)
 
 
-def test_follow_defaults_are_the_measured_recommendation():
+def test_follow_defaults_leave_priority_package_off():
     from verl.workers.config import DistillationConfig
 
     cfg = DistillationConfig()
     assert cfg.teacher_follow is False
-    assert cfg.teacher_follow_priority is True
-    assert cfg.teacher_follow_final_overtakes_mid is True
-    assert cfg.teacher_follow_max_num_batched_tokens == 2048
-    assert cfg.teacher_follow_async_scheduling is False
+    assert cfg.teacher_follow_priority is False
+    assert cfg.teacher_follow_final_overtakes_mid is False
+    assert cfg.teacher_follow_max_num_batched_tokens == 0
+    assert cfg.teacher_follow_async_scheduling is True
     assert cfg.teacher_follow_mid_max_requests == 0 and cfg.teacher_follow_mid_max_tokens == 0
 
 
