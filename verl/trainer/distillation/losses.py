@@ -420,7 +420,7 @@ def compute_distillation_loss_reverse_kl_estimator(
     valid_abs_losses = distillation_losses[response_mask_bool].abs()
     metrics = {
         "distillation/abs_loss": Metric(
-            AggregationType.MEAN, valid_abs_losses.sum() / max(valid_abs_losses.numel(), 1)
+            AggregationType.MEAN, valid_abs_losses.mean() if valid_abs_losses.numel() else valid_abs_losses.sum()
         ),
     }
     return distillation_losses, metrics

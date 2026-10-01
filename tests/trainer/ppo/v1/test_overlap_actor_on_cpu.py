@@ -209,8 +209,17 @@ def test_full_signal_precedes_profile_teardown(trainer):
 
 
 @pytest.mark.parametrize("sync_config", [{}, {"overlap_actor": False, "overlap_actor_sm_fraction": 0}])
-def test_disabled_overlap_keeps_early_actor_and_needs_no_green_or_mps(trainer, monkeypatch, sync_config):
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "megatron", "veomni", "torchtitan"])
+def test_disabled_overlap_keeps_early_actor_and_needs_no_green_or_mps(trainer, monkeypatch, sync_config, strategy):
     trainer.config.trainer.v1.sync = sync_config
+    # These legacy settings are supported independently of the narrower
+    # overlap schedule; turning overlap off must not validate its prerequisites.
+    trainer.config.actor_rollout_ref.actor.strategy = strategy
+    trainer.config.actor_rollout_ref.actor.ppo_epochs = 2
+    trainer.config.actor_rollout_ref.actor.ppo_mini_batch_size = 1
+    trainer.config.actor_rollout_ref.actor.loss_agg_mode = "seq-mean-token-mean"
+    trainer.parameter_sync_step = 2
+    trainer.config.trainer.critic_warmup = 1
     trainer.early_actor_lite = True
     trainer.opd_no_task_reward_fast_path = False
 
@@ -222,6 +231,20 @@ def test_disabled_overlap_keeps_early_actor_and_needs_no_green_or_mps(trainer, m
     trainer._configure_overlap_actor()
     assert trainer.overlap_actor is False
     assert trainer.early_actor_lite is True
+
+
+def test_disabled_overlap_preserves_base_prepare_and_student_sleep(trainer, monkeypatch):
+    trainer.overlap_actor = False
+    expected = {"legacy": True}
+    monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.PPOTrainer.prepare_step", lambda self: expected)
+    assert trainer.prepare_step() is expected
+    order = []
+    trainer.checkpoint_manager = SimpleNamespace(sleep_replicas=lambda: order.append("sleep"))
+    trainer.curr_step_profile = True
+    trainer._stop_rollout_profiling = lambda: order.append("profile_end")
+    trainer.on_sample_end()
+    assert order == ["sleep", "profile_end"]
+    assert trainer.control.phase == OverlapActorControl.LIMITED
 
 
 def test_overlap_can_be_enabled_without_early_actor_or_teacher_follow(trainer, monkeypatch):
