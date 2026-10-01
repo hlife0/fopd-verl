@@ -812,6 +812,14 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  teacher_follow: false
+  teacher_follow_min_gpu_memory_utilization: 0.75
+  teacher_follow_priority: false
+  teacher_follow_mid_max_requests: 0
+  teacher_follow_mid_max_tokens: 0
+  teacher_follow_final_overtakes_mid: false
+  teacher_follow_max_num_batched_tokens: 0
+  teacher_follow_async_scheduling: true
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
@@ -910,7 +918,11 @@ trainer:
   use_v1: true
   v1:
     trainer_mode: sync
-    sync: {}
+    sync:
+      opd_no_task_reward_fast_path: false
+      early_actor_lite: false
+      overlap_actor: false
+      overlap_actor_sm_fraction: 0.5
     colocate_async:
       num_warmup_batches: 1
     separate_async:

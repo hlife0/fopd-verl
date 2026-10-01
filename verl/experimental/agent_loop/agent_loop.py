@@ -261,10 +261,12 @@ class AgentLoopBase(ABC):
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
+        """Publish the prompt to Teacher follow when streaming state is attached."""
         if self.student_token_state is not None:
             self.student_token_state.set_prompt(prompt_ids, multi_modal_data, mm_processor_kwargs)
 
     def publish_student_response(self, token_ids: list[int]) -> None:
+        """Update the generated response visible to Teacher follow."""
         if self.student_token_state is not None:
             self.student_token_state.update_response(token_ids)
 
@@ -1058,7 +1060,11 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs, teacher_extra = await self.teacher_server_manager.compute_teacher_logprobs_single(
+            (
+                teacher_ids,
+                teacher_logprobs,
+                teacher_extra,
+            ) = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,

@@ -243,6 +243,12 @@ trainer:
       # Without the fast path, leftover Teacher overlaps old_log_prob instead.
       early_actor_lite: false
 
+      # Accumulate complete, scored trajectories during Student rollout using
+      # a limited Green compute stream; switch to full SMs after Student sleep.
+      # Independent of early_actor_lite; requires the OPD fast path and MPS.
+      overlap_actor: false
+      overlap_actor_sm_fraction: 0.5
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

@@ -19,6 +19,7 @@ versions as ``global_steps - prompt_global_steps + 1``; ``drop`` and ``wait`` ap
 trainers.
 """
 
+import asyncio
 import threading
 import time
 import uuid
@@ -1422,5 +1423,168 @@ def test_student_ready_requires_all_sessions(tq_init, partition_id):
         )
         rb._sync_metadata_from_transfer_queue()
         assert rb._student_ready_prompt_uids(partition_id, sessions_per_prompt=2) == {uid}
+    finally:
+        _clear_partition(partition_id)
+
+
+def _put_overlap_group(partition_id, uid, step=3, status="finished", student_done=True, teacher_done=True):
+    _set_prompt_status(partition_id, uid, status, step)
+    tag = {"global_steps": step, "seq_len": 3}
+    if student_done:
+        tag["student_gen_done_ts"] = 1.0
+    if teacher_done:
+        tag["teacher_done_ts"] = 2.0
+    tq.kv_put(
+        key=_trajectory_key(uid),
+        partition_id=partition_id,
+        fields={"input_ids": torch.tensor([1, 2, 3])},
+        tag=tag,
+    )
+
+
+def test_actor_overlap_replay_isolates_exact_step_and_waits_for_terminal_group(tq_init, partition_id):
+    rb = _make_rb()
+    try:
+        _put_overlap_group(partition_id, "old", step=2)
+        _put_overlap_group(partition_id, "future", step=4)
+        _put_overlap_group(partition_id, "first")
+        _put_overlap_group(partition_id, "second", status="running", teacher_done=False)
+        _set_prompt_status(partition_id, "third", "pending", 3)
+        uids = ["first", "second", "third"]
+        students, ready = rb.peek_actor_overlap_batch(partition_id, uids, 3)
+        assert students.keys == ["first_0_0", "second_0_0"]
+        assert ready == ["first_0_0"]
+        with pytest.raises(RuntimeError, match="every Teacher"):
+            rb.materialize_actor_overlap_batch(partition_id, uids, 3)
+        # Teacher publication is not yet group termination.
+        _put_overlap_group(partition_id, "second", status="running")
+        assert rb.peek_actor_overlap_batch(partition_id, uids, 3)[1] == ["first_0_0"]
+        _set_prompt_status(partition_id, "second", "finished", 3)
+        _put_overlap_group(partition_id, "third")
+        batch = rb.materialize_actor_overlap_batch(partition_id, uids, 3)
+        assert batch.keys == [f"{uid}_0_0" for uid in uids]
+        remaining = tq.kv_list(partition_id=partition_id)[partition_id]
+        assert not set(uids).intersection(remaining)
+        assert {"old", "future", "old_0_0", "future_0_0"}.issubset(remaining)
+    finally:
+        _clear_partition(partition_id)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "failure", "wrong_step", "wrong_trajectory_step", "empty", "no_teacher", "multi"]
+)
+def test_actor_overlap_replay_fails_instead_of_waiting_for_invalid_group(tq_init, partition_id, invalid):
+    rb = _make_rb()
+    try:
+        if invalid != "missing":
+            _put_overlap_group(partition_id, "bad", teacher_done=invalid != "no_teacher")
+        if invalid == "failure":
+            _set_prompt_status(partition_id, "bad", "failure", 3)
+        elif invalid == "wrong_step":
+            _set_prompt_status(partition_id, "bad", "finished", 4)
+        elif invalid == "wrong_trajectory_step":
+            tq.kv_put(key="bad_0_0", partition_id=partition_id, tag={"global_steps": 4})
+        elif invalid == "empty":
+            tq.kv_clear(partition_id=partition_id, keys=["bad_0_0"])
+        elif invalid == "multi":
+            tq.kv_put(
+                key="bad_0_1",
+                partition_id=partition_id,
+                fields={"input_ids": torch.tensor([1, 2, 3])},
+                tag={"global_steps": 3, "student_gen_done_ts": 1.0},
+            )
+        with pytest.raises(RuntimeError, match="overlap_actor"):
+            rb.peek_actor_overlap_batch(partition_id, ["bad"], 3)
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_actor_overlap_waits_for_real_async_tq_publication(tq_init, partition_id, monkeypatch):
+    from tensordict import TensorDict
+
+    rb = _make_rb()
+    client = tq.get_client()
+    put = client.async_put
+    reserved = threading.Event()
+    publish = threading.Event()
+    errors = []
+
+    async def paused_put(*args, **kwargs):
+        # This is reached after async_kv_batch_put reserved the actual key in
+        # the controller, before async_put publishes either data or custom tags.
+        reserved.set()
+        if not await asyncio.to_thread(publish.wait, 10.0):
+            raise TimeoutError("test did not release the pending TransferQueue write")
+        return await put(*args, **kwargs)
+
+    def producer():
+        try:
+            tq.kv_batch_put(
+                keys=["active_0_0"],
+                partition_id=partition_id,
+                fields=TensorDict({"input_ids": torch.tensor([[1, 2, 3]])}, batch_size=[1]),
+                tags=[{"global_steps": 3, "seq_len": 3, "student_gen_done_ts": 1.0}],
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=producer, daemon=True)
+    try:
+        _set_prompt_status(partition_id, "active", "running", 3)
+        monkeypatch.setattr(client, "async_put", paused_put)
+        thread.start()
+        assert reserved.wait(10.0)
+        assert tq.kv_list(partition_id=partition_id)[partition_id]["active_0_0"] == {}
+        students, ready = rb.peek_actor_overlap_batch(partition_id, ["active"], 3)
+        assert students.keys == ready == []
+
+        # An unfinished publication is never acceptable for a terminal prompt.
+        _set_prompt_status(partition_id, "active", "finished", 3)
+        with pytest.raises(RuntimeError, match="trajectory_step=None, prompt_finished=True"):
+            rb.peek_actor_overlap_batch(partition_id, ["active"], 3)
+        _set_prompt_status(partition_id, "active", "running", 3)
+
+        publish.set()
+        thread.join(timeout=10.0)
+        assert not thread.is_alive() and not errors
+        students, ready = rb.peek_actor_overlap_batch(partition_id, ["active"], 3)
+        assert students.keys == ["active_0_0"] and ready == []
+        tq.kv_put(key="active_0_0", partition_id=partition_id, tag={"teacher_done_ts": 2.0})
+        _set_prompt_status(partition_id, "active", "finished", 3)
+        assert rb.peek_actor_overlap_batch(partition_id, ["active"], 3)[1] == ["active_0_0"]
+    finally:
+        publish.set()
+        thread.join(timeout=10.0)
+        _clear_partition(partition_id)
+
+
+def test_actor_overlap_real_padding_is_lossless_and_teacher_fields_match_input(tq_init, partition_id):
+    from verl.trainer.ppo.padding_utils import SYNTHETIC_PADDING_SEQ_LEN, upsample_batch_to_divisible_size
+
+    try:
+        key = "real_0_0"
+        fields = {
+            "input_ids": torch.tensor([1, 2, 3, 4, 5]),
+            "prompts": torch.tensor([1, 2]),
+            "responses": torch.tensor([3, 4, 5]),
+            "response_mask": torch.ones(3, dtype=torch.long),
+            "loss_mask": torch.ones(3, dtype=torch.long),
+            "rollout_log_probs": torch.tensor([-1.0, -1.2, -1.3]),
+            "teacher_ids": torch.tensor([[1], [2], [3], [4], [5]], dtype=torch.int32),
+            "teacher_logprobs": torch.full((5, 1), -2.0),
+        }
+        tag = {"seq_len": 5, "prompt_len": 2, "response_len": 3}
+        tq.kv_put(key=key, partition_id=partition_id, fields=fields, tag=tag)
+        batch = KVBatchMeta(keys=[key], tags=[tag], partition_id=partition_id)
+        padded = upsample_batch_to_divisible_size(batch, 2, eos_token_id=0)
+        assert len(padded) == 2 and padded.tags[1]["is_padding"]
+        data = tq.kv_batch_get(keys=[padded.keys[1]], partition_id=partition_id)[0]
+        assert data["loss_mask"].sum().item() == data["response_mask"].sum().item() == 0
+        assert data["teacher_ids"].shape == data["teacher_logprobs"].shape == (SYNTHETIC_PADDING_SEQ_LEN, 1)
+        assert data["input_ids"].numel() == SYNTHETIC_PADDING_SEQ_LEN
+        # Source fields are not mutated when the padding template is constructed.
+        original = tq.kv_batch_get(keys=[key], partition_id=partition_id)[0]
+        assert original["teacher_ids"].shape == (5, 1)
+        assert original["loss_mask"].sum().item() == 3
     finally:
         _clear_partition(partition_id)

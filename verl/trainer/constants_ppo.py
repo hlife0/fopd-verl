@@ -147,6 +147,10 @@ def get_ppo_ray_runtime_env(config=None):
         "FLASH_ATTENTION_DETERMINISTIC",
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
+        "CUDA_MPS_PIPE_DIRECTORY",
+        "CUDA_MPS_LOG_DIRECTORY",
+        "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+        "CUDA_MPS_SM_PARTITION",
     ):
         val = os.environ.get(key)
         if val is not None:

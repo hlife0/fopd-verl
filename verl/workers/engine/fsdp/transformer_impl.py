@@ -716,6 +716,25 @@ class FSDPEngine(BaseEngine):
         else:
             yield
 
+    def configure_overlap_actor(self, sm_fraction: float):
+        from verl.utils.overlap_actor import OverlapActorExecution
+
+        if self._is_offload_param or self._is_offload_optimizer:
+            raise ValueError("overlap_actor requires resident Actor parameters and optimizer")
+        if self.ulysses_sequence_parallel_size != 1:
+            raise ValueError("overlap_actor currently requires sequence_parallel_size=1")
+        # FSDP retains streams after its first forward. Initialize them before
+        # any Green compute, including on a step with no early-ready samples.
+        if fsdp_version(self.module) == 1:
+            from torch.distributed.fsdp._runtime_utils import _lazy_init
+
+            _lazy_init(self.module, self.module)
+        elif fsdp_version(self.module) == 2:
+            self.module._get_fsdp_state()._lazy_init()
+        else:
+            raise ValueError("overlap_actor requires FSDP1 or FSDP2")
+        self.overlap_actor_execution = OverlapActorExecution(sm_fraction, self.get_data_parallel_group())
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -750,6 +769,8 @@ class FSDPEngine(BaseEngine):
         scaler = getattr(self, "scaler", None)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            execution = None if forward_only else getattr(self, "overlap_actor_execution", None)
+            compute_ctx = execution.microbatch(micro_batch) if execution is not None else nullcontext()
             sync_ctx = (
                 nullcontext()
                 if forward_only
@@ -760,7 +781,7 @@ class FSDPEngine(BaseEngine):
             # inside; here every micro-batch forward (and, when training, its backward) becomes a
             # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
             # when training, or directly under the stage for log-prob.
-            with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+            with compute_ctx, ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
@@ -787,6 +808,17 @@ class FSDPEngine(BaseEngine):
         Zero gradients and enforce FSDP grad-clipping logic.
         """
         self.optimizer.zero_grad()
+
+    @torch.no_grad()
+    def scale_gradients(self, factor: float):
+        """Rescale accumulated FSDP1 shards / FSDP2 DTensors before clipping.
+
+        The factor commutes with GradScaler unscaling in optimizer_step, which
+        must still happen exactly once after all held chunks have accumulated.
+        """
+        for parameter in self.module.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
 
     def optimizer_step(self):
         """

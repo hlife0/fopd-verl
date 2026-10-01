@@ -115,6 +115,12 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        # A padded streaming tail can leave a DP rank without valid tokens.
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, float("inf")),
+            "distillation/loss_max": Metric(AggregationType.MAX, float("-inf")),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -411,7 +417,10 @@ def compute_distillation_loss_reverse_kl_estimator(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
     # Since k1 can be negative, log the mean absolute loss.
+    valid_abs_losses = distillation_losses[response_mask_bool].abs()
     metrics = {
-        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+        "distillation/abs_loss": Metric(
+            AggregationType.MEAN, valid_abs_losses.sum() / max(valid_abs_losses.numel(), 1)
+        ),
     }
     return distillation_losses, metrics

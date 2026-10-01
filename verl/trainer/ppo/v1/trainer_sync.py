@@ -13,9 +13,13 @@
 # limitations under the License.
 import json
 import logging
+import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
+import ray
+import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
@@ -26,7 +30,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def _first_output(output):
-    if isinstance(output, (list, tuple)):
+    if isinstance(output, list | tuple):
         for item in output:
             if item is not None:
                 return item
@@ -42,7 +46,7 @@ def _chunk_fb_s(output) -> float | None:
         value = output["metrics"]["chunk_fb_s"]
     except Exception:
         return None
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         value = value[-1]
     try:
         return float(value)
@@ -60,6 +64,7 @@ class PPOTrainerSync(PPOTrainer):
     def on_init_end(self):
         self._configure_opd_no_task_reward_fast_path()
         self._configure_early_actor_lite()
+        self._configure_overlap_actor()
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -149,7 +154,48 @@ class PPOTrainerSync(PPOTrainer):
                 "old_log_prob with leftover Teacher scoring"
             )
 
+    def _configure_overlap_actor(self):
+        sync = self.config.trainer.v1.sync
+        self.overlap_actor = bool(sync.get("overlap_actor", False))
+        if not self.overlap_actor:
+            return
+        actor = self.config.actor_rollout_ref.actor
+        if self.early_actor_lite:
+            raise ValueError("select either overlap_actor or early_actor_lite")
+        if not self.opd_no_task_reward_fast_path or actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("overlap_actor requires the OPD fast path and FSDP1/FSDP2")
+        if actor.ppo_epochs != 1 or actor.ppo_mini_batch_size != self.config.data.train_batch_size:
+            raise ValueError("overlap_actor requires one PPO epoch and a full-batch PPO minibatch")
+        if actor.loss_agg_mode != "token-mean" or self.parameter_sync_step != 1:
+            raise ValueError("overlap_actor requires token-mean loss and parameter_sync_step=1")
+        if self.config.trainer.critic_warmup > 0 or self.config.data.max_response_length <= 0:
+            raise ValueError("overlap_actor requires no critic warmup and a positive response limit")
+        fraction = float(sync.overlap_actor_sm_fraction)
+        if not math.isfinite(fraction) or not 0 < fraction < 1:
+            raise ValueError("overlap_actor_sm_fraction must be between 0 and 1")
+        from verl.utils.overlap_actor import create_overlap_control
+
+        self.actor_rollout_wg.configure_overlap_actor(fraction)
+        self._overlap_control = create_overlap_control()
+
+    def prepare_step(self) -> dict:
+        if not getattr(self, "overlap_actor", False):
+            return super().prepare_step()
+        batch = self._next_train_batch()
+        self._overlap_prompt_uids = list(batch["uid"])
+        ray.get(self._overlap_control.begin.remote(self.global_steps))
+        self._trace_full_sm_signal_ts = None
+        self._trace_full_sm_switch_ts = None
+        try:
+            self._submit_batch_to_rollout(batch)
+        except BaseException:
+            ray.get(self._overlap_control.cancel.remote(self.global_steps))
+            raise
+        return {}
+
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int):
+        if getattr(self, "overlap_actor", False):
+            return self._stream_overlap_actor(metrics, timing_raw, sample_batch_size)
         if not self.early_actor_lite:
             return super()._step_once(metrics, timing_raw, sample_batch_size)
 
@@ -183,9 +229,7 @@ class PPOTrainerSync(PPOTrainer):
                     student_batch = self._compute_reward_colocate(student_batch, metrics=metrics)
 
             if getattr(self, "early_actor_stream_fb", False):
-                return self._stream_actor_with_leftover_teacher(
-                    student_batch, metrics, timing_raw, sample_batch_size
-                )
+                return self._stream_actor_with_leftover_teacher(student_batch, metrics, timing_raw, sample_batch_size)
 
             student_batch = self._balance_batch(student_batch, metrics=metrics)
 
@@ -236,6 +280,121 @@ class PPOTrainerSync(PPOTrainer):
 
         return batch
 
+    def _stream_overlap_actor(self, metrics, timing_raw, sample_batch_size):
+        prompt_uids = self._overlap_prompt_uids
+        if len(prompt_uids) != sample_batch_size:
+            raise RuntimeError("overlap_actor logical batch differs from submitted prompts")
+        denominator = sample_batch_size * int(self.config.data.max_response_length)
+        dp_size = self._actor_dp_size()
+        consumed, padding_keys, events = set(), [], []
+        started = finalized = students_asleep = False
+        pending = event = None
+        take = []
+        interval = min(self.replay_buffer.poll_interval, 0.01)
+        gen_start = time.time()
+        self._trace_step_start_ts = getattr(self, "_trace_step_start_ts", None) or gen_start
+        self._trace_actor_start_ts = self._trace_actor_done_ts = None
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overlap-actor")
+
+        def train_chunk(chunk, first):
+            if first:
+                self.actor_rollout_wg.begin_overlap_actor(
+                    self._overlap_control,
+                    self.global_steps,
+                    denominator,
+                )
+                self._trace_fsdp_load_end_ts = time.time()
+            return self.actor_rollout_wg.accumulate_actor(chunk)
+
+        try:
+            self.on_sample_begin()
+            while len(consumed) < sample_batch_size:
+                students, ready = self.replay_buffer.peek_actor_overlap_batch(
+                    "train",
+                    prompt_uids,
+                    self.global_steps,
+                )
+                if len(students.keys) == sample_batch_size and not students_asleep:
+                    self._trace_student_barrier_ts = time.time()
+                    self._trace_sleep_start_ts = time.time()
+                    self.on_sample_end()
+                    timing_raw["gen"] = time.time() - gen_start
+                    students_asleep = True
+                if pending is not None:
+                    if not pending.done():
+                        time.sleep(interval)
+                        continue
+                    output = pending.result()
+                    event.update(return_ts=time.time(), chunk_fb_s=_chunk_fb_s(output))
+                    events.append(event)
+                    consumed.update(take)
+                    pending = None
+                    if len(consumed) == sample_batch_size:
+                        break
+                ready = [key for key in ready if key not in consumed]
+                if not ready or (not started and not students_asleep and len(ready) < dp_size):
+                    time.sleep(interval)
+                    continue
+                take = ready
+                chunk = students.select_keys(take)
+                if chunk.extra_info is None:
+                    chunk.extra_info = {}
+                chunk.extra_info.update(self._actor_update_extra_info())
+                chunk = self._balance_batch(
+                    chunk,
+                    metrics=metrics,
+                    logging_prefix="overlap_actor_chunk",
+                    align_to_mini_batch=False,
+                )
+                padding_keys.extend(
+                    key for key, tag in zip(chunk.keys, chunk.tags, strict=True) if tag.get("is_padding", False)
+                )
+                first = not started
+                if first:
+                    self._trace_actor_start_ts = time.time()
+                    started = True
+                event = {
+                    "n": len(take),
+                    "teacher_ready_when_dispatched": len(ready),
+                    "students_done_when_dispatched": len(students.keys),
+                    "leftover_when_dispatched": sample_batch_size - len(consumed) - len(take),
+                    "is_last": len(consumed) + len(take) == sample_batch_size,
+                    "dispatch_ts": time.time(),
+                }
+                pending = executor.submit(train_chunk, chunk, first)
+            batch = self.replay_buffer.materialize_actor_overlap_batch("train", prompt_uids, self.global_steps)
+            if not students_asleep:
+                raise RuntimeError("overlap_actor cannot finish before the Student barrier")
+            self._trace_actor_finish_start_ts = time.time()
+            last_student = max(float(tag["student_gen_done_ts"]) for tag in batch.tags)
+            output = _first_output(self.actor_rollout_wg.finish_actor_accumulate(student_done_ts=last_student))
+            self._trace_actor_finish_end_ts = time.time()
+            self._trace_actor_done_ts = time.time()
+            finalized = True
+        finally:
+            try:
+                if not finalized:
+                    ray.get(self._overlap_control.cancel.remote(self.global_steps))
+            finally:
+                executor.shutdown(wait=True)
+                try:
+                    if started and not finalized:
+                        self.actor_rollout_wg.abort_actor_accumulate()
+                finally:
+                    if padding_keys:
+                        tq.kv_clear(partition_id="train", keys=padding_keys)
+            if self._trace_actor_start_ts is not None:
+                timing_raw["update_actor"] = time.time() - self._trace_actor_start_ts
+        self._trace_actor_chunk_events = events
+        batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        if output is not None:
+            self._apply_actor_update_metrics(output, metrics)
+            self._trace_full_sm_switch_ts = output["metrics"].get("overlap_actor/full_switch_ts")
+        self._record_gen_split_timing(batch, timing_raw)
+        metrics["overlap_actor/chunks"] = len(events)
+        self._dump_actor_timeline(batch)
+        return batch
+
     def _stream_actor_with_leftover_teacher(
         self,
         student_batch: KVBatchMeta,
@@ -249,9 +408,7 @@ class PPOTrainerSync(PPOTrainer):
             if not tag.get("is_padding", False)
         ]
         full_tokens = sum(
-            int(tag.get("response_len") or 0)
-            for tag in student_batch.tags
-            if not tag.get("is_padding", False)
+            int(tag.get("response_len") or 0) for tag in student_batch.tags if not tag.get("is_padding", False)
         )
         dp_size = self._actor_dp_size()
         extra_info = self._actor_update_extra_info()
@@ -270,9 +427,7 @@ class PPOTrainerSync(PPOTrainer):
                 while len(consumed) < len(traj_keys):
                     ready = [
                         key
-                        for key in self.replay_buffer.peek_teacher_ready_keys(
-                            student_batch.partition_id, traj_keys
-                        )
+                        for key in self.replay_buffer.peek_teacher_ready_keys(student_batch.partition_id, traj_keys)
                         if key not in consumed
                     ]
                     leftover = len(traj_keys) - len(consumed) - len(ready)
@@ -405,6 +560,8 @@ class PPOTrainerSync(PPOTrainer):
             "last_student_done_s": rel(last_student),
             "sleep_start_s": rel(getattr(self, "_trace_sleep_start_ts", None)),
             "sleep_end_s": rel(getattr(self, "_trace_sleep_end_ts", None)),
+            "full_sm_signal_s": rel(getattr(self, "_trace_full_sm_signal_ts", None)),
+            "full_sm_switch_s": rel(getattr(self, "_trace_full_sm_switch_ts", None)),
             "update_actor_start_s": rel(self._trace_actor_start_ts),
             "fsdp_load_end_s": rel(getattr(self, "_trace_fsdp_load_end_ts", None)),
             "chunks": chunks,
@@ -432,5 +589,8 @@ class PPOTrainerSync(PPOTrainer):
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache
         self.checkpoint_manager.sleep_replicas()
+        if getattr(self, "overlap_actor", False):
+            self._trace_sleep_end_ts = time.time()
+            self._trace_full_sm_signal_ts = ray.get(self._overlap_control.full.remote(self.global_steps))
         if self.curr_step_profile:
             self._stop_rollout_profiling()
