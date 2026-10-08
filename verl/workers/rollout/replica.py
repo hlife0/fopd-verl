@@ -262,9 +262,10 @@ class RolloutReplica(ABC):
     def rollout_worker_use_gpu(self) -> bool:
         return True
 
-    async def wake_up(self):
+    async def wake_up(self, tags: list[str] | None = None):
         """Wake up each rollout server."""
-        await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
+        kwargs = {} if tags is None else {"tags": tags}
+        await asyncio.gather(*[server.wake_up.remote(**kwargs) for server in self.servers])
 
     async def sleep(self):
         """Sleep each rollout server."""

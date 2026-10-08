@@ -759,15 +759,9 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
-        if (
-            sampling_params.logprobs is not None
-            and final_res.outputs
-            and final_res.outputs[0].logprobs
-        ):
+        if sampling_params.logprobs is not None and final_res.outputs and final_res.outputs[0].logprobs:
             decode_width = sampling_params.prompt_logprobs or sampling_params.logprobs
-            decode_ids, decode_lps = extract_topk_from_logprobs_dict(
-                final_res.outputs[0].logprobs[0], decode_width
-            )
+            decode_ids, decode_lps = extract_topk_from_logprobs_dict(final_res.outputs[0].logprobs[0], decode_width)
             extra_fields["decode_topk_ids"] = decode_ids
             extra_fields["decode_topk_logprobs"] = decode_lps
         token_ids = final_res.outputs[0].token_ids
@@ -904,7 +898,7 @@ class vLLMHttpServer:
             await self.engine.reset_prefix_cache(reset_connector=True)
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            await self.engine.wake_up(tags=self._get_wake_up_tags())
+            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
@@ -1322,7 +1316,12 @@ class vLLMHttpServer:
             and getattr(mtp_config, "enable", False)
             and getattr(mtp_config, "enable_rollout", False)
         )
-        if spec is not None or mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        if (
+            spec is not None
+            or mtp_rollout_enabled
+            or self.lora_as_adapter
+            or is_torch_npu_available(check_device=False)
+        ):
             return 1
         return 2
 

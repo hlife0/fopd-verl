@@ -254,6 +254,28 @@ class MultiTeacherModelManager:
             self.server_handles[key] = manager.server_handles
             self.load_balancer_handle[key] = manager.load_balancer_handle
 
+    @auto_await
+    async def sleep(self):
+        """Drain scoring and release Teacher memory before colocated training."""
+        await asyncio.gather(
+            *[
+                replica.sleep()
+                for manager in self.teacher_model_managers.values()
+                for replica in manager.rollout_replicas
+            ]
+        )
+
+    @auto_await
+    async def wake_up(self):
+        """Restore the frozen Teacher weights for the next scoring batch."""
+        await asyncio.gather(
+            *[
+                replica.wake_up()
+                for manager in self.teacher_model_managers.values()
+                for replica in manager.rollout_replicas
+            ]
+        )
+
     def get_client(self) -> dict[str, LLMServerClient]:
         """Get the LLMServerClient for each teacher model."""
         teacher_clients = {}

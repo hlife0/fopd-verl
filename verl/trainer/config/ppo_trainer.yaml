@@ -243,6 +243,15 @@ trainer:
       # Without the fast path, leftover Teacher overlaps old_log_prob instead.
       early_actor_lite: false
 
+      # Train on both Student and Teacher GPUs after every score is ready.
+      # Single-node FSDP + vLLM; requires Actor offload and NCCL publication.
+      # trainer.n_gpus_per_node remains the Student inference GPU count.
+      teacher_shared_actor: false
+
+      # With teacher_shared_actor, dispatch training after scoring without waiting
+      # for Student or Teacher vLLM sleep. No memory check, retry, or OOM fallback.
+      teacher_shared_actor_no_wait_sleep: false
+
       # Accumulate complete, scored trajectories during Student rollout using
       # a limited Green compute stream; switch to full SMs after Student sleep.
       # Independent of early_actor_lite; requires the OPD fast path and MPS.

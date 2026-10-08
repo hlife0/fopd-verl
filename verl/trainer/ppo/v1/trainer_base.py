@@ -49,6 +49,7 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
+from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.checkpoint_callback import build_checkpoint_callback
@@ -251,6 +252,8 @@ class PPOTrainer(ABC):
         self._init_dump_executor()
         self._init_resource_pool_mgr()
         self.resource_pool_manager.create_resource_pool()
+        if self.teacher_shared_actor:
+            self._split_teacher_shared_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # 1. define actor and rollout class
@@ -260,7 +263,7 @@ class PPOTrainer(ABC):
             cls=self.role_worker_mapping[actor_role],
             config=self.config.actor_rollout_ref,
             distillation_config=self.config.get("distillation"),
-            role=str(actor_role),
+            role="actor" if self.teacher_shared_actor else str(actor_role),
         )
         self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
 
@@ -362,18 +365,27 @@ class PPOTrainer(ABC):
                 resource_pool=teacher_resource_pool,
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            if self.teacher_shared_actor:
+                # Checkpoint loading and publication use the full Actor group,
+                # including the GPUs occupied by Teacher inference.
+                self.teacher_model_manager.sleep()
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
 
         # 9. initialize agent loop manager
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+            config=self.config,
+            worker_group=None if self.teacher_shared_actor else self.actor_rollout_wg,
+            rollout_resource_pool=self.student_resource_pool
+            if self.teacher_shared_actor
+            else actor_rollout_resource_pool,
         )
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
+        if not self.teacher_shared_actor:
+            checkpoint_engine_config.backend = "naive"
         self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
@@ -684,7 +696,7 @@ class PPOTrainer(ABC):
                 {
                     "step": self.global_steps,
                     "n": len(samples),
-                    "timing_raw": {k: float(v) for k, v in timing_raw.items() if isinstance(v, (int, float))},
+                    "timing_raw": {k: float(v) for k, v in timing_raw.items() if isinstance(v, int | float)},
                     "actor_start_ts": self._trace_actor_start_ts,
                     "actor_done_ts": self._trace_actor_done_ts,
                     "weights_start_ts": self._trace_weights_start_ts,
@@ -864,6 +876,16 @@ class PPOTrainer(ABC):
 
     def _init_resource_pool_mgr(self):
         config = self.config
+        self.teacher_shared_actor = bool(
+            OmegaConf.select(config, "trainer.v1.sync.teacher_shared_actor", default=False)
+        )
+        self.teacher_shared_actor_no_wait_sleep = bool(
+            OmegaConf.select(config, "trainer.v1.sync.teacher_shared_actor_no_wait_sleep", default=False)
+        )
+        if self.teacher_shared_actor_no_wait_sleep and not self.teacher_shared_actor:
+            raise ValueError("teacher_shared_actor_no_wait_sleep requires teacher_shared_actor=True")
+        if self.teacher_shared_actor:
+            self._validate_teacher_shared_actor()
         # role => worker class
         self.role_worker_mapping = {}
         # role => resource pool
@@ -913,10 +935,70 @@ class PPOTrainer(ABC):
                 raise ValueError("config.distillation.nnodes must be greater than 0")
 
             teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-            self.mapping[Role.TeacherModel] = "teacher_pool"
+            if self.teacher_shared_actor:
+                resource_pool_spec[global_pool_id][0] += teacher_pool[0]
+                self.mapping[Role.TeacherModel] = global_pool_id
+            else:
+                resource_pool_spec["teacher_pool"] = teacher_pool
+                self.mapping[Role.TeacherModel] = "teacher_pool"
 
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+
+    def _split_teacher_shared_pool(self):
+        # Actor rank 0 is the NCCL publisher. Put it on a Teacher GPU so
+        # publication never has two NCCL ranks on the same physical GPU.
+        pool = self.resource_pool_manager.resource_pool_dict["global_pool"]
+        teacher_pool, self.student_resource_pool = split_resource_pool(
+            pool, [self.config.distillation.n_gpus_per_node, self.config.trainer.n_gpus_per_node]
+        )
+        self.resource_pool_manager.resource_pool_dict["teacher_pool"] = teacher_pool
+        self.mapping[Role.TeacherModel] = "teacher_pool"
+
+    def _validate_teacher_shared_actor(self):
+        """Validate the synchronous, single-node Teacher/Actor sharing path before allocating GPUs."""
+        config = self.config
+        sync = config.trainer.v1.sync
+        actor = config.actor_rollout_ref.actor
+        rollout = config.actor_rollout_ref.rollout
+        if config.trainer.v1.trainer_mode != "sync" or not is_distillation_enabled(config.get("distillation")):
+            raise ValueError("teacher_shared_actor requires synchronous distillation")
+        if config.trainer.nnodes != 1 or config.distillation.nnodes != 1:
+            raise ValueError("teacher_shared_actor currently requires a single node")
+        if sync.get("parameter_sync_step", 1) != 1:
+            raise ValueError("teacher_shared_actor requires parameter_sync_step=1")
+        if any(sync.get(key, False) for key in ("early_actor_lite", "overlap_actor", "actor_rollout_overlap")):
+            raise ValueError("teacher_shared_actor waits for all Teacher scores; disable early/overlap Actor schedules")
+        if self.use_critic or self.use_reference_policy or config.reward.reward_model.enable:
+            raise ValueError("teacher_shared_actor requires no critic, reference policy, or reward model")
+        if actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("teacher_shared_actor requires FSDP1/FSDP2")
+        if not actor.fsdp_config.param_offload or not actor.fsdp_config.optimizer_offload:
+            raise ValueError("teacher_shared_actor requires Actor parameter and optimizer offload")
+        model = config.actor_rollout_ref.model
+        if model.get("lora", {}).get("rank", 0) > 0 or model.get("lora_rank", 0) > 0 or model.get("lora_adapter_path"):
+            raise ValueError("teacher_shared_actor currently requires full-model training")
+        if rollout.name != "vllm" or rollout.checkpoint_engine.backend != "nccl":
+            raise ValueError("teacher_shared_actor requires vLLM and NCCL weight publication")
+        if rollout.checkpoint_engine.engine_kwargs.get("nccl", {}).get("multi_sender", True):
+            raise ValueError("teacher_shared_actor requires NCCL multi_sender=False to avoid duplicate GPU ranks")
+        if not rollout.free_cache_engine or not rollout.get("enable_sleep_mode", True):
+            raise ValueError("teacher_shared_actor requires Student sleep mode")
+        if rollout.get("disaggregation", {}).get("enabled", False):
+            raise ValueError("teacher_shared_actor does not support disaggregated prefill/decode")
+        for teacher in config.distillation.teacher_models.values():
+            inference = teacher.inference
+            if (
+                inference.name != "vllm"
+                or not inference.free_cache_engine
+                or not inference.get("enable_sleep_mode", True)
+            ):
+                raise ValueError("teacher_shared_actor requires vLLM Teacher sleep mode")
+        student_gpus = config.trainer.n_gpus_per_node
+        rollout_size = (
+            rollout.tensor_model_parallel_size * rollout.data_parallel_size * rollout.pipeline_model_parallel_size
+        )
+        if student_gpus <= 0 or student_gpus % rollout_size:
+            raise ValueError("Student GPU count must be positive and divisible by the rollout parallel size")
 
     def _load_checkpoint(self):
         self.global_steps = 0

@@ -469,9 +469,10 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
-    async def wake_up_replicas(self):
+    async def wake_up_replicas(self, tags: list[str] | None = None):
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
-        await asyncio.gather(*[r.wake_up() for r in self.replicas])
+        kwargs = {} if tags is None else {"tags": tags}
+        await asyncio.gather(*[r.wake_up(**kwargs) for r in self.replicas])
 
     @auto_await
     async def abort_replicas(self):

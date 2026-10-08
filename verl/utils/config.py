@@ -99,6 +99,8 @@ def validate_config(
     """
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+    if OmegaConf.select(config, "trainer.v1.sync.teacher_shared_actor", default=False):
+        n_gpus += config.distillation.n_gpus_per_node * config.distillation.nnodes
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

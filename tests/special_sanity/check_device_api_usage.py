@@ -39,6 +39,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/utils/rendezvous/ray_backend.py",  # appear in cupy importance
     "verl/single_controller/ray/base.py",  # appear in default device_name
     "verl/trainer/ppo/ray_trainer.py",  # appear in default device_name
+    "verl/trainer/ppo/v1/trainer_base.py",  # validates the NCCL checkpoint backend for shared Teacher/Actor GPUs
     "verl/experimental/transfer_queue/ray_trainer.py",  # appear in docstring as default device_name
     "verl/experimental/one_step_off_policy/ray_trainer.py",  # appear in docstring as default device_name
     "verl/utils/reward_score/sandbox_fusion/utils.py",  # appear in sandbox language type
