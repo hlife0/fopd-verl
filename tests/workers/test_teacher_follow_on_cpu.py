@@ -804,3 +804,51 @@ def test_follow_cancelled_before_request_starts_releases_gate():
         assert (gate.requests, gate.tokens) == (0, 0)
 
     asyncio.run(_run())
+
+
+def test_follow_mid_gate_releases_before_overtaking_final_finishes():
+    import asyncio
+
+    from verl.experimental.teacher_loop.teacher_follow import FollowMidGate, StudentTokenState
+
+    async def _run():
+        teacher = _CachingTeacher(width=2)
+        started = asyncio.Queue()
+        generate = teacher.generate
+
+        async def _generate(request_id, **kwargs):
+            started.put_nowait(asyncio.current_task())
+            return await generate(request_id, **kwargs)
+
+        teacher.generate = _generate
+        gate = FollowMidGate(max_requests=1)
+        manager = _follow_manager(teacher, width=2, gate=gate, overtake=True)
+        state = StudentTokenState()
+        state.set_prompt(list(range(17)))
+        task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="r"))
+        mid_task = None
+        try:
+            mid_task = await asyncio.wait_for(started.get(), 5)
+            state.update_response([17, 18])
+            state.mark_done()
+            await asyncio.wait_for(started.get(), 5)
+            assert teacher.calls == [("r", 17, 1), ("r", 19, 0)]
+            assert (gate.requests, gate.tokens) == (1, 17)
+
+            teacher.release("r", 17)
+            await asyncio.wait_for(mid_task, 5)
+            assert not task.done()
+            assert (gate.requests, gate.tokens) == (0, 0)
+
+            teacher.release("r", 19)
+            ids, lps, _ = await asyncio.wait_for(task, 5)
+            _assert_matches_oneshot(ids, lps, 19, 2)
+            assert (gate.requests, gate.tokens) == (0, 0)
+        finally:
+            tasks = {task, mid_task} - {None}
+            for pending in tasks:
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(_run())

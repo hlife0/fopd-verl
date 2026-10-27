@@ -344,22 +344,17 @@ class AsyncTeacherLLMServerManager:
         routing_key: Optional[str],
         state: StudentTokenState,
         priority: int,
-        gate_cost: int = 0,
     ) -> dict:
-        """One follow request; frees its mid-follow gate slot when it returns or is cancelled."""
-        try:
-            return await self._teacher_forward(
-                payload,
-                request_id=request_id,
-                follow=True,
-                multi_modal_data=state.multi_modal_data,
-                mm_processor_kwargs=state.mm_processor_kwargs,
-                routing_key=routing_key,
-                priority=priority,
-            )
-        finally:
-            if gate_cost:
-                self.follow_mid_gate.release(gate_cost)
+        """Submit one follow request."""
+        return await self._teacher_forward(
+            payload,
+            request_id=request_id,
+            follow=True,
+            multi_modal_data=state.multi_modal_data,
+            mm_processor_kwargs=state.mm_processor_kwargs,
+            routing_key=routing_key,
+            priority=priority,
+        )
 
     async def compute_teacher_logprobs_follow(
         self,
@@ -446,9 +441,10 @@ class AsyncTeacherLLMServerManager:
                 gate_wait_s = submit_ts - gate_wait_since if gate_wait_since is not None else 0.0
                 gate_wait_since = None
                 payload = seq[:submit_len]
-                hop = asyncio.ensure_future(
-                    self._follow_forward(payload, request_id, routing_key, state, priority, gate_cost)
-                )
+                hop = asyncio.ensure_future(self._follow_forward(payload, request_id, routing_key, state, priority))
+                if gate_cost:
+                    # A task can be cancelled before its coroutine starts.
+                    hop.add_done_callback(lambda _task, cost=gate_cost: gate.release(cost))
                 final_seq = None
                 done_wait = None
                 try:
@@ -470,10 +466,11 @@ class AsyncTeacherLLMServerManager:
                             await asyncio.gather(hop, return_exceptions=True)
                     extra = None if hop.cancelled() else await hop
                 finally:
-                    if done_wait is not None:
-                        done_wait.cancel()
-                    if not hop.done():
-                        hop.cancel()
+                    pending_tasks = [task for task in (hop, done_wait) if task is not None and not task.done()]
+                    for task in pending_tasks:
+                        task.cancel()
+                    if pending_tasks:
+                        await asyncio.gather(*pending_tasks, return_exceptions=True)
                 extra_calls = 0
                 if extra is not None:
                     extra_calls = await self._apply_follow_extract(
