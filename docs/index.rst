@@ -203,6 +203,7 @@ verl is fast with:
    :caption: Development Notes
 
    sglang_multiturn/sandbox_fusion.rst
+   teacher_follow_lifecycle.md
 
 Contribution
 -------------
