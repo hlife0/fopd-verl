@@ -59,6 +59,16 @@ __all__ = [
 ]
 
 
+async def _wait_for_follow_progress(state: StudentTokenState, scored_seq_len: int) -> None:
+    """Recheck follow eligibility after clearing stale notifications, then wait if needed."""
+    state.event.clear()
+    if follow_submit_len(len(state.snapshot()), state.student_done, scored_seq_len) > scored_seq_len:
+        return
+    if state.student_done:
+        return
+    await state.event.wait()
+
+
 def _dump_follow_request_log(request_id: str, request_log: list[dict[str, Any]]) -> None:
     out_dir = os.environ.get("FOPD_SAMPLE_TRACE_DIR")
     if not out_dir or not request_log:
@@ -490,7 +500,7 @@ class AsyncTeacherLLMServerManager:
             elif state.student_done:
                 break
             else:
-                await state.wait_until_submittable(acc.scored_seq_len)
+                await _wait_for_follow_progress(state, acc.scored_seq_len)
 
         teacher_ids, teacher_logprobs = acc.finalize()
         extra_out["teacher_start_ts"] = teacher_start_ts

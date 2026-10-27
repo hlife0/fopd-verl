@@ -386,12 +386,3 @@ class StudentTokenState:
 
     def snapshot(self) -> list[int]:
         return list(self.prompt_ids) + list(self.response_ids)
-
-    async def wait_until_submittable(self, scored_seq_len: int) -> None:
-        """Wait for a new full KV block or Student done."""
-        self.event.clear()
-        if follow_submit_len(len(self.snapshot()), self.student_done, scored_seq_len) > scored_seq_len:
-            return
-        if self.student_done:
-            return
-        await self.event.wait()
