@@ -15,6 +15,7 @@
 
 from typing import Any
 
+import pytest
 import torch
 
 from verl.experimental.teacher_loop.teacher_follow import (
@@ -681,3 +682,125 @@ def test_follow_matches_oneshot_without_using_decode_rows():
     # Several mid hops ran, each ending just past a block, and no row came from a decode row.
     assert sum(1 for _, n, p in teacher.calls if p == 1) >= 5
     _assert_matches_oneshot(ids, lps, 20 + 133, width)
+
+
+@pytest.mark.parametrize("phase", ["mid", "overtake_wait", "overtake_final"])
+def test_follow_cancellation_waits_for_requests_and_releases_gate(phase):
+    import asyncio
+
+    from verl.experimental.teacher_loop.teacher_follow import FollowMidGate, StudentTokenState
+
+    class _ObservedDoneEvent(asyncio.Event):
+        def __init__(self):
+            super().__init__()
+            self.wait_task = None
+
+        async def wait(self):
+            self.wait_task = asyncio.current_task()
+            return await super().wait()
+
+    class _CancellationTeacher(_CachingTeacher):
+        def __init__(self):
+            super().__init__(width=2)
+            self.mid_started = asyncio.Event()
+            self.final_started = asyncio.Event()
+            self.next_started = asyncio.Event()
+            self.cleanup_started = asyncio.Event()
+            self.allow_cleanup = asyncio.Event()
+            self.mid_task = None
+            self.cancelled = set()
+
+        async def generate(self, request_id, *, priority=0, **kwargs):
+            if request_id == "cancel" and priority == 1:
+                self.mid_task = asyncio.current_task()
+                self.mid_started.set()
+            elif request_id == "cancel":
+                self.final_started.set()
+            else:
+                self.next_started.set()
+            try:
+                return await super().generate(request_id, priority=priority, **kwargs)
+            except asyncio.CancelledError:
+                self.cancelled.add((request_id, priority))
+                if request_id == "cancel" and priority == 1:
+                    self.cleanup_started.set()
+                    await self.allow_cleanup.wait()
+                raise
+
+    async def _run():
+        teacher = _CancellationTeacher()
+        gate = FollowMidGate(max_requests=1)
+        manager = _follow_manager(teacher, width=2, gate=gate, overtake=phase != "mid")
+        state = StudentTokenState()
+        state.done = _ObservedDoneEvent()
+        state.set_prompt(list(range(17)))
+        task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="cancel"))
+        next_task = None
+        try:
+            await asyncio.wait_for(teacher.mid_started.wait(), 5)
+            assert (gate.requests, gate.tokens) == (1, 17)
+            if phase == "overtake_final":
+                state.update_response([17, 18])
+                state.mark_done()
+                await asyncio.wait_for(teacher.final_started.wait(), 5)
+
+            task.cancel()
+            await asyncio.wait_for(teacher.cleanup_started.wait(), 5)
+            # The outer call must keep ownership until the mid request finishes cleanup.
+            assert not task.done()
+            assert not teacher.mid_task.done()
+            assert (gate.requests, gate.tokens) == (1, 17)
+
+            teacher.allow_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+            assert teacher.mid_task.cancelled()
+            assert (gate.requests, gate.tokens) == (0, 0)
+            if state.done.wait_task is not None:
+                assert state.done.wait_task.done()
+            if phase == "overtake_final":
+                assert ("cancel", 0) in teacher.cancelled
+
+            # A new mid request must be admitted after cancellation releases the slot.
+            next_state = StudentTokenState()
+            next_state.set_prompt(list(range(100, 117)))
+            next_task = asyncio.create_task(manager.compute_teacher_logprobs_follow(next_state, request_id="next"))
+            await asyncio.wait_for(teacher.next_started.wait(), 5)
+            assert teacher.calls[-1] == ("next", 17, 1)
+            next_state.mark_done()
+            teacher.release("next", 17)
+            ids, lps, _ = await asyncio.wait_for(next_task, 5)
+            _assert_matches_oneshot(ids, lps, 17, 2)
+            assert (gate.requests, gate.tokens) == (0, 0)
+        finally:
+            teacher.allow_cleanup.set()
+            tasks = {task, next_task, teacher.mid_task, state.done.wait_task} - {None}
+            for pending in tasks:
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
+def test_follow_cancelled_before_request_starts_releases_gate():
+    import asyncio
+
+    from verl.experimental.teacher_loop.teacher_follow import FollowMidGate, StudentTokenState
+
+    async def _run():
+        teacher = _CachingTeacher(width=2)
+        gate = FollowMidGate(max_requests=1)
+        manager = _follow_manager(teacher, width=2, gate=gate)
+        state = StudentTokenState()
+        state.set_prompt(list(range(17)))
+        task = asyncio.create_task(manager.compute_teacher_logprobs_follow(state, request_id="cancel"))
+        # The follow loop acquires the gate and queues its hop before this callback runs.
+        # Cancelling the parent then cancels the hop before its first coroutine step.
+        asyncio.get_running_loop().call_soon(task.cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert teacher.calls == []
+        assert (gate.requests, gate.tokens) == (0, 0)
+
+    asyncio.run(_run())
