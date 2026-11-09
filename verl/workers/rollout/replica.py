@@ -118,6 +118,8 @@ class RolloutReplica(ABC):
         self.is_reward_model = is_reward_model
         self.is_teacher_model = is_teacher_model
         self.name_suffix = f"_{name_suffix}" if name_suffix else ""
+        # Extra environment for this replica's server and the engine workers it spawns.
+        self.extra_env_vars: dict[str, str] = {}
 
         self.rollout_mode: RolloutMode = None
         self.workers: list[ActorHandle] = []

@@ -889,6 +889,8 @@ distillation:
   teacher_follow_final_overtakes_mid: false
   teacher_follow_max_num_batched_tokens: 0
   teacher_follow_async_scheduling: true
+  teacher_placement: dedicated
+  teacher_green_sms: 0
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
@@ -921,6 +923,7 @@ distillation:
         data_parallel_size: 1
         expert_parallel_size: 1
         tensor_model_parallel_size: 2
+        pipeline_model_parallel_size: 1
         max_num_batched_tokens: 8192
         max_model_len: null
         max_num_seqs: 1024
@@ -994,6 +997,8 @@ trainer:
       teacher_shared_actor_no_wait_sleep: false
       overlap_actor: false
       overlap_actor_sm_fraction: 0.5
+      swap_placement: false
+      swap_initial_tokens_per_s_per_gpu: 5000
     colocate_async:
       num_warmup_batches: 1
     separate_async:

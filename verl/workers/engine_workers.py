@@ -18,7 +18,7 @@ import math
 import os
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import partial
 from itertools import chain
@@ -396,8 +396,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
         return [x for xs in global_token_num_output for x in xs]
 
-    def _close_held_train(self, *, step: bool):
+    def _close_held_train(self, *, step: bool, after_step=None, extra_outputs=None):
+        """Finish (step=True) or abort the held context.
+
+        after_step runs after the optimizer and LR steps, while parameters are still loaded.
+        extra_outputs are chunk outputs produced elsewhere (a swap placement peer group) whose
+        loss contributions are normalized together with this group's.
+        """
         ctx = self._held_train_ctx
+        if extra_outputs:
+            self._held_output_lst.extend(extra_outputs)
         try:
             grad_norm = None
             lr = None
@@ -417,6 +425,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     self.engine.scale_gradients(normalization_scale)
                 grad_norm = self.engine.optimizer_step()
                 lr = self.engine.lr_scheduler_step()
+                if after_step is not None:
+                    after_step()
             if self.engine.is_mp_src_rank_with_outputs():
                 actor_output = [tu.get(output, "metrics") for output in self._held_output_lst]
                 metrics = {}
@@ -502,6 +512,79 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def abort_held_train(self):
         if self._held_train_ctx is None:
             return
+        self._close_held_train(step=False)
+
+    # Swap placement: a main FSDP group (owns the optimizer) and a peer group in a separate
+    # world (forward/backward only) train one step together. See engine/fsdp/swap_transfer.py.
+
+    def swap_layout(self) -> list:
+        from verl.workers.engine.fsdp.swap_transfer import flat_params, unit_layout
+
+        return unit_layout(flat_params(self.engine.module))
+
+    def swap_init_transfer(self, host: str, port: int, rank: int, main_world: int, peer_world: int, numels: list):
+        from verl.workers.engine.fsdp.swap_transfer import TransferGroup
+
+        self._swap_group = TransferGroup.create(host, port, rank, main_world, peer_world)
+        self._swap_numels = list(numels)
+
+    @contextmanager
+    def _swap_params_loaded(self):
+        """Keep FlatParameters on the device for a transfer outside a held context."""
+        offload = self._held_train_ctx is None and self.engine.is_param_offload_enabled
+        if offload:
+            self.engine.to(get_device_name(), model=True, optimizer=False, grad=False)
+        try:
+            yield
+        finally:
+            if offload:
+                self.engine.to("cpu", model=True, optimizer=False, grad=False)
+
+    def swap_push_params(self):
+        from verl.workers.engine.fsdp.swap_transfer import flat_params, push_main_params
+
+        with self._swap_params_loaded():
+            push_main_params(flat_params(self.engine.module), self._swap_group, self._swap_numels)
+        get_torch_device().synchronize()
+
+    def swap_pull_params(self):
+        from verl.workers.engine.fsdp.swap_transfer import flat_params, pull_main_params
+
+        with self._swap_params_loaded():
+            pull_main_params(flat_params(self.engine.module), self._swap_group, self._swap_numels)
+        get_torch_device().synchronize()
+
+    def swap_peer_push_grads(self) -> list:
+        """Peer phase 1: send gradients and the loss-token count; return this group's chunk outputs."""
+        from verl.workers.engine.fsdp.swap_transfer import flat_params, push_peer_grads
+
+        if self._held_train_ctx is None:
+            raise RuntimeError("held train is not open")
+        push_peer_grads(flat_params(self.engine.module), self._swap_group, self._swap_numels, self._held_loss_tokens)
+        get_torch_device().synchronize()
+        outputs, self._held_output_lst = self._held_output_lst, []
+        return outputs
+
+    def swap_main_pull_grads(self):
+        """Main phase 1: add the peer gradients (and peer loss tokens on rank 0) into this group."""
+        from verl.workers.engine.fsdp.swap_transfer import flat_params, pull_peer_grads
+
+        if self._held_train_ctx is None:
+            raise RuntimeError("held train is not open")
+        pull_peer_grads(flat_params(self.engine.module), self._swap_group, self._swap_numels, self._held_loss_tokens)
+        get_torch_device().synchronize()
+
+    def swap_main_finish(self, peer_outputs=None):
+        """Main phase 2: normalize, clip and step once, then send the new parameters to the peer."""
+        if self._held_train_ctx is None:
+            raise RuntimeError("held train is not open")
+        return self._close_held_train(step=True, after_step=self.swap_push_params, extra_outputs=peer_outputs)
+
+    def swap_peer_finish(self):
+        """Peer phase 2: receive the new parameters, then drop this group's gradients."""
+        if self._held_train_ctx is None:
+            raise RuntimeError("held train is not open")
+        self.swap_pull_params()
         self._close_held_train(step=False)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
@@ -626,13 +709,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ref_worker_cls = TrainingWorker
 
     def __init__(
-        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
+        self,
+        config: DictConfig,
+        role: str,
+        distillation_config: Optional[DistillationConfig] = None,
+        swap_peer: bool = False,
+        **kwargs,
     ):
         Worker.__init__(self)
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.role = role
+        # Swap placement peer: an Actor replica without an optimizer whose gradients are
+        # added into the main Actor group (trainer.v1.sync.swap_placement).
+        self.swap_peer = swap_peer
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
         self.rollout: BaseRollout = None
@@ -774,7 +865,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_type=actor_config.model_config.get("model_type", "language_model"),
                 model_config=actor_config.model_config,
                 engine_config=actor_config.engine,
-                optimizer_config=actor_config.optim,
+                optimizer_config=None if self.swap_peer else actor_config.optim,
                 checkpoint_config=actor_config.checkpoint,
                 profiler_config=actor_profiler_config,
             )
@@ -913,6 +1004,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def abort_actor_accumulate(self):
         self.actor.abort_held_train()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def swap_layout(self):
+        return self.actor.swap_layout()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def swap_transfer_address(self):
+        import ray
+
+        from verl.workers.engine.fsdp.swap_transfer import free_port
+
+        return ray.util.get_node_ip_address(), free_port()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_init_transfer(self, host: str, port: int, main_world: int, peer_world: int, numels: list):
+        rank = torch.distributed.get_rank() + (main_world if self.swap_peer else 0)
+        self.actor.swap_init_transfer(host, port, rank, main_world, peer_world, numels)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_push_params(self):
+        self.actor.swap_push_params()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_pull_params(self):
+        self.actor.swap_pull_params()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_peer_push_grads(self):
+        return self.actor.swap_peer_push_grads()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_main_pull_grads(self):
+        self.actor.swap_main_pull_grads()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_main_finish(self, peer_outputs=None):
+        return self.actor.swap_main_finish(peer_outputs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def swap_peer_finish(self):
+        self.actor.swap_peer_finish()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

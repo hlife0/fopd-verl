@@ -259,6 +259,14 @@ class DistillationConfig(BaseConfig):
         turn vLLM async scheduling off on the Teacher, so a request that
         arrives mid-step joins the next step rather than the one after it.
         True leaves vLLM's own choice.
+    teacher_placement (str):
+        "dedicated" runs the Teacher on its own resource pool (n_gpus_per_node * nnodes).
+        "student" runs one Teacher replica on the Student rollout GPUs instead, typically
+        pipeline parallel across them (trainer.v1.sync.swap_placement); the distillation pool
+        then hosts no Teacher.
+    teacher_green_sms (int):
+        With teacher_placement="student", run the Teacher engine workers on the first N SMs of
+        each GPU through a CUDA green context (0 = all SMs). Needs MPS to share the GPU.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -303,6 +311,8 @@ class DistillationConfig(BaseConfig):
     teacher_follow_final_overtakes_mid: bool = False
     teacher_follow_max_num_batched_tokens: int = 0
     teacher_follow_async_scheduling: bool = True
+    teacher_placement: str = "dedicated"
+    teacher_green_sms: int = 0
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -313,6 +323,10 @@ class DistillationConfig(BaseConfig):
         if not self.enabled:
             return
 
+        if self.teacher_placement not in ("dedicated", "student"):
+            raise ValueError(f"teacher_placement must be 'dedicated' or 'student', got {self.teacher_placement!r}")
+        if self.teacher_green_sms < 0 or (self.teacher_green_sms and self.teacher_placement != "student"):
+            raise ValueError("teacher_green_sms needs teacher_placement='student' and a non-negative SM count")
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
@@ -321,6 +335,9 @@ class DistillationConfig(BaseConfig):
                 topk=self.distillation_loss.topk,
             )
             teacher_world_size_sum += teacher_model.world_size
+        if self.teacher_placement == "student":
+            # The trainer checks the replica against the Student GPU count.
+            return
         total_pool_size = self.n_gpus_per_node * self.nnodes
         if teacher_world_size_sum != total_pool_size:
             raise ValueError(
@@ -331,7 +348,13 @@ class DistillationConfig(BaseConfig):
 
     def _resolve_teacher_models(self) -> dict[str, DistillationTeacherModelConfig]:
         assert "teacher_model" in self.teacher_models
-        if len(self.teacher_models) == 1:
+        if self.teacher_placement == "student":
+            if len(self.teacher_models) != 1:
+                raise NotImplementedError("teacher_placement='student' supports a single Teacher")
+            teacher_model = self.teacher_models["teacher_model"]
+            teacher_model.num_replicas = 1
+            teacher_model.key = "default"
+        elif len(self.teacher_models) == 1:
             # Single teacher occupies the entire teacher resource pool.
             teacher_model = self.teacher_models["teacher_model"]
             inference = teacher_model.inference

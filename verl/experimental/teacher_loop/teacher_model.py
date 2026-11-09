@@ -29,7 +29,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _configure_teacher_follow_replicas(replicas, rollout_config, distillation_config) -> None:
+def _configure_teacher_follow_replicas(replicas, rollout_config, distillation_config, raise_kv_floor=True) -> None:
     """Enable follow-only engine settings on Teacher replicas.
 
     Batch-invariant attention keeps growing prefixes numerically closer to a
@@ -67,6 +67,8 @@ def _configure_teacher_follow_replicas(replicas, rollout_config, distillation_co
         vllm_ek["max_num_batched_tokens"] = step_tokens
     if not distillation_config.teacher_follow_async_scheduling:
         vllm_ek["async_scheduling"] = False
+    if not raise_kv_floor:
+        return
     current = float(vllm_ek.get("gpu_memory_utilization") or getattr(rollout_config, "gpu_memory_utilization", 0) or 0)
     if current < min_util:
         vllm_ek["gpu_memory_utilization"] = min_util
@@ -91,6 +93,7 @@ class TeacherModelManager:
         distillation_config: DistillationConfig,
         teacher_model_config: DistillationTeacherModelConfig,
         resource_pool: RayResourcePool,
+        gpus_per_node: int | None = None,
     ):
         """
         Initialize the teacher model manager.
@@ -98,13 +101,18 @@ class TeacherModelManager:
         Args:
             distillation_config (DistillationConfig): Distillation configuration.
             teacher_model_config (DistillationTeacherModelConfig): Teacher model configuration.
-            resource_pool (RayResourcePool): Dedicated teacher resource pool.
+            resource_pool (RayResourcePool): Teacher resource pool (the Student pool when
+                teacher_placement="student").
+            gpus_per_node (int, optional): GPUs per node of resource_pool; defaults to the
+                distillation pool's.
         """
 
         # Need dataclass conversion for max_logprobs handling in post_init
         self.distillation_config = distillation_config
         self.teacher_model_config = teacher_model_config
         self.resource_pool = resource_pool
+        self.gpus_per_node = gpus_per_node or distillation_config.n_gpus_per_node
+        self.on_student_gpus = distillation_config.teacher_placement == "student"
         self._initialize_llm_servers()
         self._initialize_load_balancer_handle()
 
@@ -121,7 +129,7 @@ class TeacherModelManager:
                 f"{self.resource_pool.world_size}."
             )
 
-        gpus_per_node = self.distillation_config.n_gpus_per_node
+        gpus_per_node = self.gpus_per_node
         rollout_replica_class = get_rollout_replica_class(teacher_model_config.inference.name)
         rollout_config = teacher_model_config.inference
         # Keep the model path unresolved until the rollout server actor is
@@ -135,6 +143,8 @@ class TeacherModelManager:
             }
         )
         name_suffix = (teacher_model_config.key or "").replace("/", "_")
+        if self.on_student_gpus:
+            name_suffix = f"{name_suffix}_on_student"
         self.rollout_replicas = [
             rollout_replica_class(
                 replica_rank=replica_rank,
@@ -147,7 +157,17 @@ class TeacherModelManager:
             for replica_rank in range(num_replicas)
         ]
         if self.distillation_config.teacher_follow:
-            _configure_teacher_follow_replicas(self.rollout_replicas, rollout_config, self.distillation_config)
+            # On Student GPUs the Teacher's KV budget is fixed explicitly (kv_cache_memory_bytes);
+            # the follow floor would claim most of a GPU the Student and Actor share.
+            _configure_teacher_follow_replicas(
+                self.rollout_replicas,
+                rollout_config,
+                self.distillation_config,
+                raise_kv_floor=not self.on_student_gpus,
+            )
+        if self.on_student_gpus and self.distillation_config.teacher_green_sms:
+            for replica in self.rollout_replicas:
+                replica.extra_env_vars["VERL_GREEN_SMS"] = str(self.distillation_config.teacher_green_sms)
         split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
         assert len(split_resource_pools) == len(self.rollout_replicas)
         self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)
@@ -219,6 +239,7 @@ class MultiTeacherModelManager:
         self,
         config: DictConfig,
         resource_pool: RayResourcePool,
+        gpus_per_node: int | None = None,
     ):
         """
         Initialize the multi-teacher model manager.
@@ -226,11 +247,14 @@ class MultiTeacherModelManager:
         Args:
             config (DictConfig): Full configuration.
             resource_pool (RayResourcePool): Combined resource pool for all teachers.
+            gpus_per_node (int, optional): GPUs per node of resource_pool, if it is not the
+                distillation pool.
         """
         self.config = config
         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
 
         self.resource_pool = resource_pool
+        self.gpus_per_node = gpus_per_node
         self.teacher_model_managers: dict[str, TeacherModelManager] = {}
         self.server_addresses: dict[str, list[str]] = {}
         self.server_handles: dict[str, list] = {}
@@ -248,6 +272,7 @@ class MultiTeacherModelManager:
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,
                 resource_pool=teacher_pool,
+                gpus_per_node=self.gpus_per_node,
             )
             self.teacher_model_managers[key] = manager
             self.server_addresses[key] = manager.server_addresses

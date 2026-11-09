@@ -335,6 +335,26 @@ class PPOTrainer(ABC):
         self.actor_rollout_wg.init_model()
         logger.info("actor and ref model engine initialized")
 
+        # 6.1 swap placement: a forward/backward-only Actor replica on the distillation GPUs,
+        # in its own torch.distributed world.
+        self.swap_peer_wg = None
+        if self.swap_placement:
+            peer_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[actor_role],
+                config=self.config.actor_rollout_ref,
+                distillation_config=self.config.get("distillation"),
+                role="actor",
+                swap_peer=True,
+            )
+            self.swap_peer_wg = RayWorkerGroup(
+                resource_pool=self.resource_pool_manager.resource_pool_dict["swap_peer_pool"],
+                ray_cls_with_init=peer_cls,
+                name_prefix="swap_peer",
+                **wg_kwargs,
+            )
+            self.swap_peer_wg.init_model()
+            logger.info("swap placement peer actor initialized")
+
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = self.config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -363,6 +383,9 @@ class PPOTrainer(ABC):
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
+                # Swap placement starts the Teacher across the Student GPUs before the Student
+                # engine, which then sees the Teacher's memory as used.
+                gpus_per_node=self.config.trainer.n_gpus_per_node if self.swap_placement else None,
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
             if self.teacher_shared_actor:
@@ -886,6 +909,11 @@ class PPOTrainer(ABC):
             raise ValueError("teacher_shared_actor_no_wait_sleep requires teacher_shared_actor=True")
         if self.teacher_shared_actor:
             self._validate_teacher_shared_actor()
+        self.swap_placement = bool(OmegaConf.select(config, "trainer.v1.sync.swap_placement", default=False))
+        if self.swap_placement:
+            self._validate_swap_placement()
+        elif OmegaConf.select(config, "distillation.teacher_placement", default="dedicated") == "student":
+            raise ValueError("distillation.teacher_placement=student requires trainer.v1.sync.swap_placement=True")
         # role => worker class
         self.role_worker_mapping = {}
         # role => resource pool
@@ -937,6 +965,10 @@ class PPOTrainer(ABC):
             teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
             if self.teacher_shared_actor:
                 resource_pool_spec[global_pool_id][0] += teacher_pool[0]
+                self.mapping[Role.TeacherModel] = global_pool_id
+            elif self.swap_placement:
+                # The Teacher runs on the Student GPUs; the distillation GPUs host the peer Actor.
+                resource_pool_spec["swap_peer_pool"] = teacher_pool
                 self.mapping[Role.TeacherModel] = global_pool_id
             else:
                 resource_pool_spec["teacher_pool"] = teacher_pool
@@ -999,6 +1031,65 @@ class PPOTrainer(ABC):
         )
         if student_gpus <= 0 or student_gpus % rollout_size:
             raise ValueError("Student GPU count must be positive and divisible by the rollout parallel size")
+
+    def _validate_swap_placement(self):
+        """Validate swap placement before allocating GPUs.
+
+        One Teacher replica runs on the Student GPUs (teacher_placement=student); the
+        distillation GPUs host a peer FSDP Actor that runs forward/backward on scored samples
+        during rollout. Its gradients are added into the main Actor before the one update.
+        """
+        config = self.config
+        sync = config.trainer.v1.sync
+        actor = config.actor_rollout_ref.actor
+        rollout = config.actor_rollout_ref.rollout
+        distillation = config.get("distillation")
+        if config.trainer.v1.trainer_mode != "sync" or not is_distillation_enabled(distillation):
+            raise ValueError("swap_placement requires synchronous distillation")
+        if distillation.get("teacher_placement", "dedicated") != "student":
+            raise ValueError("swap_placement requires distillation.teacher_placement=student")
+        if config.trainer.nnodes != 1 or distillation.nnodes != 1:
+            raise ValueError("swap_placement currently requires a single node")
+        if distillation.n_gpus_per_node <= 0:
+            raise ValueError("swap_placement needs at least one distillation GPU for the peer Actor")
+        if any(
+            sync.get(key, False)
+            for key in ("teacher_shared_actor", "early_actor_lite", "overlap_actor", "actor_rollout_overlap")
+        ):
+            raise ValueError("swap_placement replaces the teacher-shared, early and overlap Actor schedules")
+        if sync.get("parameter_sync_step", 1) != 1:
+            raise ValueError("swap_placement requires parameter_sync_step=1")
+        if not sync.get("opd_no_task_reward_fast_path", False):
+            raise ValueError("swap_placement requires the OPD no-task-reward fast path")
+        if self.use_critic or self.use_reference_policy or config.reward.reward_model.enable:
+            raise ValueError("swap_placement requires no critic, reference policy, or reward model")
+        if actor.strategy != "fsdp":
+            raise ValueError("swap_placement gradient transfer supports FSDP1 (actor.strategy=fsdp)")
+        if actor.get("ulysses_sequence_parallel_size", 1) != 1:
+            raise ValueError("swap_placement requires ulysses_sequence_parallel_size=1")
+        if actor.ppo_epochs != 1 or actor.ppo_mini_batch_size != config.data.train_batch_size:
+            raise ValueError("swap_placement requires one PPO epoch and a full-batch PPO minibatch")
+        if actor.loss_agg_mode != "token-mean" or config.trainer.critic_warmup > 0:
+            raise ValueError("swap_placement requires token-mean loss and no critic warmup")
+        if int(rollout.n) != 1 or config.data.max_response_length <= 0:
+            raise ValueError("swap_placement requires rollout.n=1 and a positive response limit")
+        model = config.actor_rollout_ref.model
+        if model.get("lora", {}).get("rank", 0) > 0 or model.get("lora_rank", 0) > 0 or model.get("lora_adapter_path"):
+            raise ValueError("swap_placement currently requires full-model training")
+        if rollout.name != "vllm" or rollout.get("disaggregation", {}).get("enabled", False):
+            raise ValueError("swap_placement requires vLLM rollout without disaggregated prefill/decode")
+        for teacher in distillation.teacher_models.values():
+            inference = teacher.inference
+            size = (
+                inference.tensor_model_parallel_size
+                * inference.data_parallel_size
+                * inference.pipeline_model_parallel_size
+            )
+            if inference.name != "vllm" or size != config.trainer.n_gpus_per_node:
+                raise ValueError(
+                    "swap_placement runs one vLLM Teacher replica across the Student GPUs: "
+                    "Teacher TP * DP * PP must equal trainer.n_gpus_per_node"
+                )
 
     def _load_checkpoint(self):
         self.global_steps = 0
@@ -1728,8 +1819,8 @@ class PPOTrainer(ABC):
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
-    def _actor_dp_size(self) -> int:
-        role, worker_group = "actor", self.actor_rollout_wg
+    def _actor_dp_size(self, worker_group=None) -> int:
+        role, worker_group = "actor", worker_group or self.actor_rollout_wg
         if role not in worker_group._dispatch_info:
             dp_rank_mapping = worker_group._query_dispatch_info(role)
             worker_group._dispatch_info[role] = dp_rank_mapping
@@ -1744,9 +1835,10 @@ class PPOTrainer(ABC):
         logging_prefix="global_seqlen",
         keep_minibatch=False,
         align_to_mini_batch=True,
+        worker_group=None,
     ):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
-        dp_size = self._actor_dp_size()
+        dp_size = self._actor_dp_size(worker_group)
 
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size) if align_to_mini_batch else dp_size
