@@ -183,6 +183,11 @@ class vLLMColocateWorkerExtension:
     def __new__(cls, **kwargs):
         set_death_signal()
 
+        # Optional SM restriction for this engine, set per replica (e.g. a colocated Teacher).
+        from verl.utils.green_context import install_vllm_green_hook
+
+        install_vllm_green_hook()
+
         if os.environ.get("VERL_FULL_DETERMINISM", "0") == "1":
             from verl.workers.engine.utils import enable_full_determinism
 

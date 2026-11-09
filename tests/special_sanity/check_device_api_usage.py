@@ -26,6 +26,7 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/utils/device.py",
     "verl/utils/overlap_actor.py",  # CUDA Green Context streams and MPS resource checks
+    "verl/utils/green_context.py",  # CUDA Green Context streams for a colocated vLLM engine
     "verl/utils/torch_functional.py",  # import flash_attn only on cuda
     "verl/plugin/platform/platform_base.py",  # docstring mentions torch.cuda
     "verl/plugin/platform/platform_cuda.py",  # CUDA platform implementation

@@ -266,6 +266,15 @@ trainer:
       overlap_actor: false
       overlap_actor_sm_fraction: 0.5
 
+      # Teacher on the Student GPUs (distillation.teacher_placement=student), a
+      # forward/backward-only peer Actor on the distillation GPUs. The peer trains on
+      # scored samples during rollout; the Student-GPU Actor joins after the Student
+      # barrier; gradients are merged on GPU before one update. FSDP1 + vLLM, OPD fast path.
+      swap_placement: false
+
+      # Per-GPU F/B token throughput assumed until a chunk is measured (scheduling only).
+      swap_initial_tokens_per_s_per_gpu: 5000
+
     # Asynchronous PPO trainer with colocated trainer and rollout
     colocate_async:
 

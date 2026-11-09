@@ -68,6 +68,37 @@ def _chunk_fb_timestamps(output) -> dict:
     return result
 
 
+def swap_assign(
+    ready: list,
+    tokens: dict,
+    idle: list,
+    busy_until: dict,
+    rates: dict,
+    dp: dict,
+    now: float,
+    tail: bool,
+) -> dict:
+    """Pick the scored samples each idle Actor group trains next (swap placement).
+
+    Every ready sample is placed, longest first, on the started group that would finish it
+    earliest, counting the work a busy group still has (busy_until) and each group's token
+    throughput. Only placements on idle groups are dispatched; the rest wait for the busy
+    group. This keeps a slow group from taking a burst the fast group would finish sooner, and
+    leaves the last short samples to whichever group frees up first. Until the tail (all scores
+    in), an idle group only starts a chunk with at least one sample per DP rank.
+    """
+    if not ready or not idle:
+        return {}
+    finish = {name: now for name in idle}
+    finish.update({name: max(until, now) for name, until in busy_until.items()})
+    plan = {name: [] for name in finish}
+    for key in sorted(ready, key=lambda key: tokens[key], reverse=True):
+        name = min(finish, key=lambda g: finish[g] + tokens[key] / rates[g])
+        finish[name] += tokens[key] / rates[name]
+        plan[name].append(key)
+    return {name: keys for name, keys in plan.items() if name in idle and keys and (tail or len(keys) >= dp[name])}
+
+
 @register_trainer("sync")
 class PPOTrainerSync(PPOTrainer):
     """Synchronous PPO trainer
@@ -79,6 +110,7 @@ class PPOTrainerSync(PPOTrainer):
         self._configure_opd_no_task_reward_fast_path()
         self._configure_early_actor_lite()
         self._configure_overlap_actor()
+        self._configure_swap_placement()
         # update weights after loading checkpoint
         self._publish_actor_weights()
 
@@ -153,6 +185,9 @@ class PPOTrainerSync(PPOTrainer):
             metrics["teacher_shared_actor/optimize"] = int(getattr(self, "teacher_shared_actor_optimize", False))
         if getattr(self, "early_actor_plus", False):
             metrics["early_actor_plus/enabled"] = 1
+        if getattr(self, "swap_placement", False):
+            metrics["swap_placement/main_gpus"] = self.actor_rollout_wg.world_size
+            metrics["swap_placement/peer_gpus"] = self.swap_peer_wg.world_size
         return batch
 
     def _configure_opd_no_task_reward_fast_path(self) -> None:
@@ -256,7 +291,39 @@ class PPOTrainerSync(PPOTrainer):
         self.actor_rollout_wg.configure_overlap_actor(fraction)
         self._overlap_control = create_overlap_control()
 
+    def _configure_swap_placement(self):
+        if not getattr(self, "swap_placement", False):
+            return
+        from verl.workers.engine.fsdp.swap_transfer import matching_numels
+
+        main_wg, peer_wg = self.actor_rollout_wg, self.swap_peer_wg
+        main_world, peer_world = main_wg.world_size, peer_wg.world_size
+        numels = matching_numels(
+            _first_output(main_wg.swap_layout()),
+            _first_output(peer_wg.swap_layout()),
+            max(main_world, peer_world),
+        )
+        host, port = _first_output(main_wg.swap_transfer_address())
+        ray.get(
+            main_wg.swap_init_transfer(host, port, main_world, peer_world, numels)
+            + peer_wg.swap_init_transfer(host, port, main_world, peer_world, numels)
+        )
+        # The peer starts from the main group's (possibly resumed) parameters.
+        ray.get(main_wg.swap_push_params() + peer_wg.swap_pull_params())
+        self._swap_rate_per_rank = float(self.config.trainer.v1.sync.get("swap_initial_tokens_per_s_per_gpu", 5000))
+        logger.info(
+            "swap_placement: main Actor %d GPUs, peer Actor %d GPUs, %d FSDP units",
+            main_world,
+            peer_world,
+            len(numels),
+        )
+
     def prepare_step(self) -> dict:
+        if getattr(self, "swap_placement", False):
+            batch = self._next_train_batch()
+            self._swap_prompt_uids = list(batch["uid"])
+            self._submit_batch_to_rollout(batch)
+            return {}
         if not getattr(self, "overlap_actor", False):
             return super().prepare_step()
         batch = self._next_train_batch()
@@ -272,6 +339,8 @@ class PPOTrainerSync(PPOTrainer):
         return {}
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int):
+        if getattr(self, "swap_placement", False):
+            return self._stream_swap_placement(metrics, timing_raw, sample_batch_size)
         if getattr(self, "overlap_actor", False):
             return self._stream_overlap_actor(metrics, timing_raw, sample_batch_size)
         if not self.early_actor_lite:
@@ -506,6 +575,168 @@ class PPOTrainerSync(PPOTrainer):
                 # Join on failure too: no sleep may leak into the next step or
                 # race a weight publication. result() also propagates RPC errors.
                 sleep_future.result()
+
+    def _stream_swap_placement(self, metrics, timing_raw, sample_batch_size):
+        """One step of swap placement.
+
+        The peer Actor (on the GPUs that used to serve the Teacher) trains on scored samples
+        while the Student is still decoding; the main Actor (on the Student GPUs) joins after the
+        Student barrier. Both draw from one ready queue and accumulate gradients normalized by
+        the same denominator. The peer's gradients and loss tokens are then added into the main
+        group, which clips and steps once and sends the new parameters back to the peer.
+        """
+        prompt_uids = self._swap_prompt_uids
+        if len(prompt_uids) != sample_batch_size:
+            raise RuntimeError("swap_placement logical batch differs from submitted prompts")
+        denominator = sample_batch_size * int(self.config.data.max_response_length)
+        groups = {"main": self.actor_rollout_wg, "peer": self.swap_peer_wg}
+        dp = {name: self._actor_dp_size(wg) for name, wg in groups.items()}
+        # Token throughput per group: a per-GPU guess until measured, then the last chunks'.
+        base_rate = getattr(self, "_swap_rate_per_rank", 5000.0)
+        rates = dict(getattr(self, "_swap_rates", None) or {name: base_rate * dp[name] for name in groups})
+        measured = set(getattr(self, "_swap_rates_measured", ()))
+        started = {"main": False, "peer": False}
+        pending = {}  # group -> (future, keys, event)
+        consumed, assigned = set(), set()
+        padding_keys, events = [], []
+        students_asleep = finished = False
+        output = None
+        interval = min(self.replay_buffer.poll_interval, 0.01)
+        gen_start = time.time()
+        self._trace_step_start_ts = getattr(self, "_trace_step_start_ts", None) or gen_start
+        self._trace_actor_start_ts = self._trace_actor_done_ts = None
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="swap-actor")
+
+        def dispatch(name, keys, students, ready_count):
+            chunk = students.select_keys(keys)
+            if chunk.extra_info is None:
+                chunk.extra_info = {}
+            chunk.extra_info.update(self._actor_update_extra_info())
+            chunk = self._balance_batch(
+                chunk,
+                metrics=metrics,
+                logging_prefix=f"swap_{name}_chunk",
+                align_to_mini_batch=False,
+                worker_group=groups[name],
+            )
+            padding_keys.extend(
+                key for key, tag in zip(chunk.keys, chunk.tags, strict=True) if tag.get("is_padding", False)
+            )
+            event = {
+                "group": name,
+                "n": len(keys),
+                "tokens": sum(tokens[key] for key in keys),
+                "teacher_ready_when_dispatched": ready_count,
+                "students_done_when_dispatched": len(students.keys),
+                "dispatch_ts": time.time(),
+            }
+            if self._trace_actor_start_ts is None:
+                self._trace_actor_start_ts = event["dispatch_ts"]
+            assigned.update(keys)
+            pending[name] = (executor.submit(groups[name].accumulate_actor, chunk), keys, event)
+
+        tokens = {}
+        try:
+            self.on_sample_begin()
+            self.swap_peer_wg.begin_actor_accumulate(denominator)
+            started["peer"] = True
+            while len(consumed) < sample_batch_size:
+                students, ready = self.replay_buffer.peek_actor_overlap_batch("train", prompt_uids, self.global_steps)
+                if len(students.keys) == sample_batch_size and not students_asleep:
+                    self._trace_student_barrier_ts = self._trace_sleep_start_ts = time.time()
+                    self.on_sample_end()
+                    self._trace_sleep_end_ts = time.time()
+                    timing_raw["gen"] = time.time() - gen_start
+                    students_asleep = True
+                    self.actor_rollout_wg.begin_actor_accumulate(denominator)
+                    self._trace_fsdp_load_end_ts = time.time()
+                    started["main"] = True
+                for name in list(pending):
+                    future, keys, event = pending[name]
+                    if not future.done():
+                        continue
+                    chunk_output = future.result()
+                    event.update(return_ts=time.time(), chunk_fb_s=_chunk_fb_s(chunk_output))
+                    wall = event["return_ts"] - event["dispatch_ts"]
+                    if wall > 0 and event["tokens"] > 0:
+                        observed = event["tokens"] / wall
+                        rates[name] = observed if name not in measured else 0.5 * rates[name] + 0.5 * observed
+                        measured.add(name)
+                        other = "main" if name == "peer" else "peer"
+                        if other not in measured:
+                            rates[other] = rates[name] / dp[name] * dp[other]
+                    events.append(event)
+                    consumed.update(keys)
+                    del pending[name]
+                if len(consumed) == sample_batch_size:
+                    break
+                for tag, key in zip(students.tags, students.keys, strict=True):
+                    tokens.setdefault(key, max(int(tag.get("seq_len") or 1), 1))
+                ready = [key for key in ready if key not in assigned]
+                idle = [name for name in ("main", "peer") if started[name] and name not in pending]
+                now = time.time()
+                busy_until = {
+                    name: event["dispatch_ts"] + event["tokens"] / rates[name]
+                    for name, (_, _, event) in pending.items()
+                }
+                tail = students_asleep and len(assigned) + len(ready) == sample_batch_size
+                plan = swap_assign(ready, tokens, idle, busy_until, rates, dp, now, tail)
+                if not plan:
+                    time.sleep(interval)
+                    continue
+                for name, keys in plan.items():
+                    dispatch(name, keys, students, len(ready))
+            batch = self.replay_buffer.materialize_actor_overlap_batch("train", prompt_uids, self.global_steps)
+            if not students_asleep:
+                raise RuntimeError("swap_placement cannot finish before the Student barrier")
+
+            self._trace_actor_finish_start_ts = time.time()
+            peer_used = any(event["group"] == "peer" for event in events)
+            peer_outputs = None
+            with marked_timer("swap_merge", timing_raw, color="red"):
+                if peer_used:
+                    peer_refs = self.swap_peer_wg.swap_peer_push_grads()
+                    main_refs = self.actor_rollout_wg.swap_main_pull_grads()
+                    peer_outputs = _first_output(ray.get(peer_refs))
+                    ray.get(main_refs)
+            with marked_timer("swap_finish", timing_raw, color="red"):
+                main_refs = self.actor_rollout_wg.swap_main_finish(peer_outputs)
+                peer_refs = self.swap_peer_wg.swap_peer_finish()
+                output = _first_output(ray.get(main_refs))
+                ray.get(peer_refs)
+            self._trace_actor_finish_end_ts = self._trace_actor_done_ts = time.time()
+            finished = True
+        finally:
+            try:
+                executor.shutdown(wait=True)
+                if not finished:
+                    for name, wg in groups.items():
+                        if started[name]:
+                            wg.abort_actor_accumulate()
+            finally:
+                if padding_keys:
+                    tq.kv_clear(partition_id="train", keys=padding_keys)
+            if self._trace_actor_start_ts is not None:
+                timing_raw["update_actor"] = time.time() - self._trace_actor_start_ts
+        self._swap_rates, self._swap_rates_measured = rates, measured
+        self._trace_actor_chunk_events = events
+        batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        if output is not None:
+            self._apply_actor_update_metrics(output, metrics)
+        self._record_gen_split_timing(batch, timing_raw)
+        for name in groups:
+            mine = [event for event in events if event["group"] == name]
+            metrics[f"swap_placement/{name}_chunks"] = len(mine)
+            metrics[f"swap_placement/{name}_samples"] = sum(event["n"] for event in mine)
+            metrics[f"swap_placement/{name}_tokens"] = sum(event["tokens"] for event in mine)
+            metrics[f"swap_placement/{name}_tokens_per_s"] = rates[name]
+            if mine:
+                first = min(event["dispatch_ts"] for event in mine)
+                last = max(event["return_ts"] for event in mine)
+                metrics[f"swap_placement/{name}_first_dispatch_s"] = first - self._trace_step_start_ts
+                metrics[f"swap_placement/{name}_last_return_s"] = last - self._trace_step_start_ts
+        self._dump_actor_timeline(batch)
+        return batch
 
     def _stream_actor_with_leftover_teacher(
         self,

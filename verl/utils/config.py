@@ -97,6 +97,9 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    if config.actor_rollout_ref.rollout.get("pipeline_model_parallel_size", 1) > 1:
+        raise NotImplementedError("Student rollout weight sync requires pipeline_model_parallel_size=1")
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
     if OmegaConf.select(config, "trainer.v1.sync.teacher_shared_actor", default=False):

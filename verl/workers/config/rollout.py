@@ -323,8 +323,10 @@ class RolloutConfig(BaseConfig):
                     f"tensor_model_parallel_size={self.tensor_model_parallel_size})"
                 )
 
+        # vLLM PP serves frozen models only (e.g. a distillation Teacher); the Student rollout,
+        # which receives weight updates, is held to PP=1 by validate_config.
         if self.pipeline_model_parallel_size > 1:
-            if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
+            if self.name == "sglang" or self.name == "trtllm":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )

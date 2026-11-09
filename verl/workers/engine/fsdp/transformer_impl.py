@@ -610,7 +610,9 @@ class FSDPEngine(BaseEngine):
         module = self._build_fsdp_module(module)
         log_gpu_memory_usage("After FSDP", logger=None)
 
-        if not self.engine_config.forward_only:
+        # No optimizer_config: a forward/backward-only replica (swap placement peer) whose
+        # gradients are reduced into another group that owns the optimizer.
+        if not self.engine_config.forward_only and self.optimizer_config is not None:
             # Initialize optimizer with model parameters and config settings
             optimizer = self._build_optimizer(module)
             # Create learning rate scheduler with warmup and decay settings
@@ -830,7 +832,10 @@ class FSDPEngine(BaseEngine):
         """
         Zero gradients and enforce FSDP grad-clipping logic.
         """
-        self.optimizer.zero_grad()
+        if self.optimizer is None:
+            self.module.zero_grad(set_to_none=True)
+        else:
+            self.optimizer.zero_grad()
 
     @torch.no_grad()
     def scale_gradients(self, factor: float):
