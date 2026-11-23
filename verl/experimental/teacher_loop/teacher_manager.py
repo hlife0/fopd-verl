@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import logging
 import os
 from typing import Any, Optional
@@ -113,6 +114,7 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
+    @opd_timeline.observed("teacher.score", "teacher", coarse=False)
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],

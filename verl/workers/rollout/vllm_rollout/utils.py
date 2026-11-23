@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import ctypes
 import dataclasses
 import functools
@@ -141,6 +142,7 @@ class vLLMColocateWorkerExtension:
     """
 
     def __new__(cls, **kwargs):
+        opd_timeline.install_vllm_worker_observer()
         set_death_signal()
 
         if os.environ.get("VERL_FULL_DETERMINISM", "0") == "1":

@@ -15,6 +15,7 @@
 # TODO: move this file to verl.experimental.agent_loop after V1 is stable
 """TransferQueue adapter for AgentLoopManager and AgentLoopWorker"""
 
+from verl.utils import opd_timeline
 import asyncio
 import logging
 import os
@@ -225,6 +226,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tags=tags,
             partition_id="train" if not validate else "val",
         )
+        opd_timeline.emit("trajectory.ready", members=list(keys))
+        opd_timeline.flush()
 
 
 class AgentLoopManagerTQ(AgentLoopManager):

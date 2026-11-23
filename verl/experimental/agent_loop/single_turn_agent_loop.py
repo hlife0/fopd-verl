@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import logging
 import os
 from typing import Any
@@ -35,6 +36,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.response_length = self.rollout_config.response_length
 
     @rollout_trace_op
+    @opd_timeline.observed("student.generate", "student", coarse=False)
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
         priority = int(priority)
