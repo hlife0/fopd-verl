@@ -14,6 +14,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from verl.checkpoint_engine.base import CheckpointEngineWorker
 from verl.workers.engine_workers import ActorRolloutRefWorker
@@ -77,6 +78,23 @@ def test_actor_worker_passes_global_steps_to_checkpoint_engine_send():
 
     assert checkpoint_engine.sent_global_steps == 17
     assert checkpoint_engine.sent_weights == worker.actor.engine.weights
+
+
+def test_nccl_publication_freezes_gc_at_requested_step(monkeypatch):
+    from verl.workers import engine_workers
+
+    collect, freeze = Mock(), Mock()
+    monkeypatch.setenv("OPD_PUBLICATION_GC_FREEZE_STEP", "2")
+    monkeypatch.setattr(engine_workers.gc, "collect", collect)
+    monkeypatch.setattr(engine_workers.gc, "freeze", freeze)
+    worker = ActorRolloutRefWorker.__new__(ActorRolloutRefWorker)
+    worker.config = SimpleNamespace(rollout=SimpleNamespace(checkpoint_engine=SimpleNamespace(backend="nccl")))
+    worker.actor = SimpleNamespace(engine=_FakeTrainerEngine())
+    worker.checkpoint_engine = _FakeCheckpointEngine()
+    for step in (1, 2, 3):
+        asyncio.run(ActorRolloutRefWorker.update_weights.__wrapped__(worker, global_steps=step))
+    collect.assert_called_once()
+    freeze.assert_called_once()
 
 
 def test_checkpoint_worker_passes_global_steps_to_receive_and_rollout_update():

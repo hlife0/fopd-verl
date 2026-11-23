@@ -954,6 +954,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
 
+        freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
+        publication_opt = bool(freeze_step)
+        if publication_opt and global_steps == int(freeze_step):
+            # Apply at the warm-up boundary for NCCL publication as well.
+            gc.collect()
+            gc.freeze()
+            logger.warning("OPD publication GC frozen at global step %s", global_steps)
+
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
             if effective_mode == "delta_sharded":
@@ -966,13 +974,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return metrics or {}
 
         set_expandable_segments(False)
-        freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
-        publication_opt = bool(freeze_step)
-        if publication_opt and global_steps == int(freeze_step):
-            # Warm-up boundary: later cleanup scans only objects allocated after this.
-            gc.collect()
-            gc.freeze()
-            logger.warning("OPD publication GC frozen at global step %s", global_steps)
         aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
