@@ -1000,6 +1000,7 @@ trainer:
       overlap_actor: false
       overlap_actor_sm_fraction: 0.5
       swap_placement: false
+      fused_inference: false
       swap_initial_tokens_per_s_per_gpu: 5000
     colocate_async:
       num_warmup_batches: 1

@@ -272,6 +272,11 @@ trainer:
       # barrier; gradients are merged on GPU before one update. FSDP1 + vLLM, OPD fast path.
       swap_placement: false
 
+      # All trainer GPUs run Student decode and one pipeline-parallel Teacher. After the
+      # Student barrier the Student sleeps, scoring finishes, then one FSDP update runs
+      # on those same GPUs. No peer Actor and no gradient merge.
+      fused_inference: false
+
       # Per-GPU F/B token throughput assumed until a chunk is measured (scheduling only).
       swap_initial_tokens_per_s_per_gpu: 5000
 

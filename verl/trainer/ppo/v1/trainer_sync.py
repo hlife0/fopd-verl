@@ -115,6 +115,23 @@ class PPOTrainerSync(PPOTrainer):
         self._publish_actor_weights()
 
     def _publish_actor_weights(self):
+        if getattr(self, "fused_inference", False) and self.teacher_model_manager is not None:
+            # Student KV is remapped onto the same GPUs the Teacher still holds.
+            # Release the Teacher first, publish, then bring the Teacher back.
+            timing = getattr(self, "timing_raw", None)
+            if timing is None:
+                self.teacher_model_manager.sleep()
+                try:
+                    return self.checkpoint_manager.update_weights(self.global_steps)
+                finally:
+                    self.teacher_model_manager.wake_up()
+            with marked_timer("teacher_sleep", timing, color="red"):
+                self.teacher_model_manager.sleep()
+            try:
+                return self.checkpoint_manager.update_weights(self.global_steps)
+            finally:
+                with marked_timer("teacher_wake", timing, color="red"):
+                    self.teacher_model_manager.wake_up()
         if not getattr(self, "teacher_shared_actor", False):
             return self.checkpoint_manager.update_weights(self.global_steps)
         # Initial checkpoint publication runs before fit() creates per-step timers.
@@ -188,6 +205,8 @@ class PPOTrainerSync(PPOTrainer):
         if getattr(self, "swap_placement", False):
             metrics["swap_placement/main_gpus"] = self.actor_rollout_wg.world_size
             metrics["swap_placement/peer_gpus"] = self.swap_peer_wg.world_size
+        if getattr(self, "fused_inference", False):
+            metrics["fused_inference/gpus"] = self.actor_rollout_wg.world_size
         return batch
 
     def _configure_opd_no_task_reward_fast_path(self) -> None:
@@ -225,6 +244,17 @@ class PPOTrainerSync(PPOTrainer):
             raise ValueError("the OPD no-task-reward fast path requires agent-loop reward scoring")
 
     def _configure_early_actor_lite(self) -> None:
+        if getattr(self, "fused_inference", False):
+            # One group owns every GPU. Sleep the Student when it finishes, let the Teacher
+            # score the remainder, then run a single FSDP update. Do not stream F/B onto
+            # those GPUs while the Teacher is still scoring.
+            self.early_actor_lite = True
+            self.early_actor_stream_fb = False
+            logger.info(
+                "fused_inference: %d GPUs, sleep Student at its barrier, train after Teacher scores",
+                self.actor_rollout_wg.world_size,
+            )
+            return
         sync_config = self.config.trainer.v1.sync
         self.early_actor_plus = bool(sync_config.get("early_actor_plus", False))
         self.early_actor_lite = bool(sync_config.get("early_actor_lite", False)) or self.early_actor_plus
