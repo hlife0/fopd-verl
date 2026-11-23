@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_e2e_timer
 import json
 import logging
 import math
@@ -579,6 +580,7 @@ class PPOTrainerSync(PPOTrainer):
         with open(os.path.join(out_dir, f"step_{self.global_steps}_actor_timeline.json"), "w") as fh:
             json.dump(payload, fh, indent=2)
 
+    @opd_e2e_timer.finish
     def on_step_end(self):
         self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):

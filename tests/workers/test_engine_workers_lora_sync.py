@@ -463,3 +463,62 @@ class TestEdgeCases:
 
         engine.get_per_tensor_param.assert_called_once_with(layered_summon=False, base_sync_done=True)
         assert rollout.update_weights.call_args.kwargs["base_sync_done"] is True
+
+
+def test_publication_releases_export_cache_before_kv_wake(monkeypatch):
+    import inspect
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from verl.workers import engine_workers
+
+    monkeypatch.setenv("OPD_PUBLICATION_GC_FREEZE_STEP", "2")
+    events = []
+    device = SimpleNamespace(
+        synchronize=lambda: events.append("sync"),
+        empty_cache=lambda: events.append("empty"),
+    )
+    monkeypatch.setattr(engine_workers, "get_torch_device", lambda: device)
+    monkeypatch.setattr(engine_workers, "set_expandable_segments", lambda value: None)
+    monkeypatch.setattr(engine_workers, "log_gpu_memory_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_workers, "aggressive_empty_cache", lambda **kwargs: events.append("pre_cleanup"))
+    monkeypatch.setattr(engine_workers.torch.distributed, "barrier", lambda **kwargs: events.append("barrier"))
+
+    async def resume(tags):
+        events.append(tags[0])
+
+    async def send(*args, **kwargs):
+        events.append("send")
+
+    engine = SimpleNamespace(
+        is_param_offload_enabled=False,
+        get_per_tensor_param=lambda **kwargs: (iter(()), None),
+        get_data_parallel_group=lambda: None,
+    )
+    worker = SimpleNamespace(
+        config=SimpleNamespace(
+            rollout=OmegaConf.create(
+                {"name": "vllm", "free_cache_engine": True, "checkpoint_engine": {"backend": "naive"}}
+            )
+        ),
+        actor=SimpleNamespace(engine=engine),
+        rollout=SimpleNamespace(resume=resume, update_weights=send),
+        layered_summon=False,
+        peft_merge=False,
+        base_sync_done=True,
+    )
+    update = inspect.unwrap(engine_workers.ActorRolloutRefWorker.update_weights)
+    asyncio.run(update(worker, global_steps=3))
+    assert events == ["pre_cleanup", "weights", "send", "sync", "empty", "barrier", "kv_cache"]
+
+    events.clear()
+    engine.overlap_actor_execution = object()
+    asyncio.run(update(worker, global_steps=3))
+    assert events == ["pre_cleanup", "weights", "send", "sync", "empty", "barrier", "kv_cache"]
+
+    events.clear()
+    monkeypatch.delenv("OPD_PUBLICATION_GC_FREEZE_STEP")
+    del engine.overlap_actor_execution
+    asyncio.run(update(worker, global_steps=3))
+    assert events == ["pre_cleanup", "weights", "send", "pre_cleanup", "kv_cache"]
