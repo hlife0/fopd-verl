@@ -82,6 +82,8 @@ def stream_sm_count(stream) -> int:
 
 
 def check_mps_client():
+    import fcntl
+
     if not os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
         raise RuntimeError("overlap_actor requires an active MPS service and CUDA_MPS_PIPE_DIRECTORY")
     for key in ("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "FOPD_MPS_ACTOR_PERCENT"):
@@ -102,13 +104,18 @@ def check_mps_client():
         return result.stdout.strip()
 
     try:
-        servers = [int(line) for line in query("get_server_list").splitlines() if line.strip().isdigit()]
-        for server in servers:
-            clients = {int(line) for line in query(f"get_client_list {server}").splitlines() if line.strip().isdigit()}
-            if os.getpid() in clients:
-                if float(query(f"get_active_thread_percentage {server}")) != 100:
-                    raise ValueError("overlap_actor requires an MPS server without an active-thread percentage cap")
-                return
+        # The control CLI shares its response pipe across callers. Actor ranks
+        # initialize together, so serialize their queries to this MPS service.
+        lock_path = os.path.join(os.environ["CUDA_MPS_PIPE_DIRECTORY"], "verl-overlap-check.lock")
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            servers = [int(line) for line in query("get_server_list").splitlines() if line.strip().isdigit()]
+            for server in servers:
+                clients = {int(line) for line in query(f"get_client_list {server}").splitlines() if line.strip().isdigit()}
+                if os.getpid() in clients:
+                    if float(query(f"get_active_thread_percentage {server}")) != 100:
+                        raise ValueError("overlap_actor requires an MPS server without an active-thread percentage cap")
+                    return
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("overlap_actor could not query its MPS service") from exc
     raise RuntimeError("Actor CUDA context is not connected to the configured MPS service")

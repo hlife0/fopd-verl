@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import json
 import logging
 import math
@@ -213,6 +214,7 @@ class PPOTrainerSync(PPOTrainer):
                     sessions_per_prompt=sessions_per_prompt,
                 )
                 self._trace_student_barrier_ts = time.time()
+                opd_timeline.emit("student.barrier", role="driver", step=self.global_steps)
                 student_batch: KVBatchMeta = self.replay_buffer.peek_student_ready(
                     partition_id="train",
                     batch_size=sample_batch_size,
@@ -451,8 +453,11 @@ class PPOTrainerSync(PPOTrainer):
                         logging_prefix="early_actor_chunk",
                         align_to_mini_batch=False,
                     )
+                    if opd_timeline.enabled(self.global_steps):
+                        chunk.extra_info["timeline_chunk"] = len(chunk_sizes)
                     dispatch_ts = time.time()
-                    output = self.actor_rollout_wg.accumulate_actor(chunk)
+                    with opd_timeline.span("actor.dispatch", role="driver", step=self.global_steps, members=list(chunk.keys), chunk=len(chunk_sizes)):
+                        output = self.actor_rollout_wg.accumulate_actor(chunk)
                     return_ts = time.time()
                     consumed.update(take)
                     chunk_sizes.append(take_n)
@@ -579,6 +584,7 @@ class PPOTrainerSync(PPOTrainer):
         with open(os.path.join(out_dir, f"step_{self.global_steps}_actor_timeline.json"), "w") as fh:
             json.dump(payload, fh, indent=2)
 
+    @opd_timeline.observed("weights.ready", "driver", coarse=True)
     def on_step_end(self):
         self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):
@@ -586,6 +592,7 @@ class PPOTrainerSync(PPOTrainer):
             self.checkpoint_manager.update_weights(self.global_steps)
         self._trace_weights_done_ts = time.time()
 
+    @opd_timeline.observed("kv.sleep", "driver", coarse=False)
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache
         self.checkpoint_manager.sleep_replicas()

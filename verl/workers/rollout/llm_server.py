@@ -17,6 +17,7 @@ Utility classes for manage and request LLM servers:
 - LLMServerClient: proxy client to request LLM servers, used by AgentLoopWorker.
 """
 
+from verl.utils import opd_timeline
 import asyncio
 import logging
 import os
@@ -118,6 +119,8 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        if opd_timeline.enabled():
+            kwargs["timeline_context"] = opd_timeline.context()
         # Notify kwargs are generate()-only; drop them before server acquire.
         notify_kwargs = {}
         if "token_notify_actor" in kwargs:
