@@ -286,6 +286,7 @@ def test_swap_placement_pools_put_the_teacher_on_student_gpus():
     "override,message",
     [
         ({"early_actor_lite": "true"}, "replaces"),
+        ({"early_actor_plus": "true"}, "replaces"),
         ({"opd_no_task_reward_fast_path": "false"}, "fast path"),
     ],
 )
@@ -324,6 +325,12 @@ def test_fused_inference_rejects_a_teacher_that_does_not_span_the_node():
     config = _swap_config(swap_placement="false", fused_inference="true")
     config.distillation.teacher_models.teacher_model.inference.pipeline_model_parallel_size = 2
     with pytest.raises(ValueError, match="TP \\* DP \\* PP"):
+        _validator(config)._init_resource_pool_mgr()
+
+
+def test_fused_inference_rejects_early_actor_plus():
+    config = _swap_config(swap_placement="false", fused_inference="true", early_actor_plus="true")
+    with pytest.raises(ValueError, match="fused_inference replaces"):
         _validator(config)._init_resource_pool_mgr()
 
 

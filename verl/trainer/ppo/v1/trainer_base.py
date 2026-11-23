@@ -1075,7 +1075,13 @@ class PPOTrainer(ABC):
             raise ValueError("swap_placement needs at least one distillation GPU for the peer Actor")
         if any(
             sync.get(key, False)
-            for key in ("teacher_shared_actor", "early_actor_lite", "overlap_actor", "actor_rollout_overlap")
+            for key in (
+                "teacher_shared_actor",
+                "early_actor_lite",
+                "early_actor_plus",
+                "overlap_actor",
+                "actor_rollout_overlap",
+            )
         ):
             raise ValueError("swap_placement replaces the teacher-shared, early and overlap Actor schedules")
         if sync.get("parameter_sync_step", 1) != 1:
@@ -1126,9 +1132,15 @@ class PPOTrainer(ABC):
             raise ValueError("fused_inference currently requires a single node")
         if any(
             sync.get(key, False)
-            for key in ("teacher_shared_actor", "overlap_actor", "actor_rollout_overlap", "swap_placement")
+            for key in (
+                "teacher_shared_actor",
+                "early_actor_plus",
+                "overlap_actor",
+                "actor_rollout_overlap",
+                "swap_placement",
+            )
         ):
-            raise ValueError("fused_inference replaces teacher-shared, overlap, and swap placement")
+            raise ValueError("fused_inference replaces teacher-shared, early_actor_plus, overlap, and swap placement")
         if not sync.get("opd_no_task_reward_fast_path", False):
             raise ValueError("fused_inference requires the OPD no-task-reward fast path")
         if self.use_critic or self.use_reference_policy or config.reward.reward_model.enable:
