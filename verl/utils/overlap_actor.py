@@ -19,6 +19,7 @@ uses the Green stream, and no limited microbatch remains queued at a boundary.
 """
 
 import math
+import json
 import os
 import subprocess
 import time
@@ -36,11 +37,24 @@ class OverlapActorControl:
         self.step = None
         self.phase = self.CANCELLED
         self.full_ts = 0.0
+        self.done, self.total = 0, 0
 
     def begin(self, step: int):
         if self.step is not None and step <= self.step:
             raise ValueError("overlap_actor step must advance")
         self.step, self.phase, self.full_ts = step, self.LIMITED, 0.0
+        self.done, self.total = 0, 0
+
+    def progress(self, step, done, total):
+        """Publish completed requests independently of Actor chunk completion."""
+        self.get(step)
+        if not 0 <= done <= total or done < self.done:
+            raise ValueError("Student progress must be monotonic and bounded")
+        self.done, self.total = done, total
+
+    def state(self, step):
+        """Return the phase and observed progress in one control RPC."""
+        return (*self.get(step), self.done, self.total)
 
     def get(self, step: int):
         if step != self.step:
@@ -82,6 +96,8 @@ def stream_sm_count(stream) -> int:
 
 
 def check_mps_client():
+    import fcntl
+
     if not os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
         raise RuntimeError("overlap_actor requires an active MPS service and CUDA_MPS_PIPE_DIRECTORY")
     for key in ("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "FOPD_MPS_ACTOR_PERCENT"):
@@ -102,13 +118,18 @@ def check_mps_client():
         return result.stdout.strip()
 
     try:
-        servers = [int(line) for line in query("get_server_list").splitlines() if line.strip().isdigit()]
-        for server in servers:
-            clients = {int(line) for line in query(f"get_client_list {server}").splitlines() if line.strip().isdigit()}
-            if os.getpid() in clients:
-                if float(query(f"get_active_thread_percentage {server}")) != 100:
-                    raise ValueError("overlap_actor requires an MPS server without an active-thread percentage cap")
-                return
+        # The control CLI shares its response pipe across callers. Actor ranks
+        # initialize together, so serialize their queries to this MPS service.
+        lock_path = os.path.join(os.environ["CUDA_MPS_PIPE_DIRECTORY"], "verl-overlap-check.lock")
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            servers = [int(line) for line in query("get_server_list").splitlines() if line.strip().isdigit()]
+            for server in servers:
+                clients = {int(line) for line in query(f"get_client_list {server}").splitlines() if line.strip().isdigit()}
+                if os.getpid() in clients:
+                    if float(query(f"get_active_thread_percentage {server}")) != 100:
+                        raise ValueError("overlap_actor requires an MPS server without an active-thread percentage cap")
+                    return
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("overlap_actor could not query its MPS service") from exc
     raise RuntimeError("Actor CUDA context is not connected to the configured MPS service")
@@ -141,6 +162,20 @@ class OverlapActorExecution:
         self.green = torch.cuda.GreenContext.create(requested, self.device)
         self.limited = self.green.Stream()
         self.limited_sms = stream_sm_count(self.limited)
+        self.policy = os.environ.get("FOPD_ADAPTIVE_POLICY", "")
+        if self.policy not in ("bounded32", "tail-adaptive", "tail128", "batch128", "defer-limited", "defer128", "split32", "split32-hint", "wide64", "wide128", "keep64", "drain64"):
+            raise ValueError("Experimental Actor modules require an explicit policy")
+        if self.limited_sms != 32 or self.total_sms != 132:
+            raise ValueError("This experiment is calibrated for H800, starting at 32/132 SM")
+        self.streams = {32: self.limited}
+        self.contexts = {32: self.green}
+        if self.policy in ("tail-adaptive", "tail128", "batch128", "defer-limited", "defer128", "wide64", "wide128", "keep64", "drain64"):
+            for sms in (64, 128):
+                context = torch.cuda.GreenContext.create(sms, self.device)
+                stream = context.Stream()
+                if stream_sm_count(stream) != sms:
+                    raise RuntimeError(f"Requested {sms} SM but received another allocation")
+                self.contexts[sms], self.streams[sms] = context, stream
         if self.limited_sms > self.total_sms * sm_fraction or self.limited_sms >= self.total_sms:
             raise RuntimeError("Green stream did not honor the requested overlap_actor SM budget")
         if stream_sm_count(self.primary) != self.total_sms:
@@ -148,7 +183,7 @@ class OverlapActorExecution:
         self.group = group
         self.rank = dist.get_rank(group)
         self.source = dist.get_global_rank(group, 0) if group is not None else 0
-        self.status = torch.zeros(2, dtype=torch.float64, device=self.device)
+        self.status = torch.zeros(4, dtype=torch.float64, device=self.device)
         # Initialize this process group's NCCL stream in the primary context.
         dist.all_reduce(self.status, group=group)
         torch.cuda.synchronize()
@@ -164,6 +199,12 @@ class OverlapActorExecution:
         self.full_microbatches = 0
         self.limited_completions = []
         self.early_samples = 0
+        self.active_sms = 32
+        self.limited = self.streams[32]
+        self.done = self.total = self.max_tokens = 0
+        self.mb_events = []
+        self.pending_deferred_grads = False
+        self.deferred_microbatches = 0
 
     def _phase(self):
         # Rank 0 may finish a microbatch before its peers. Read control only
@@ -173,13 +214,14 @@ class OverlapActorExecution:
         error = None
         if self.rank == 0:
             try:
-                phase, timestamp = ray.get(self.control.get.remote(self.step))
+                phase, timestamp, done, total = ray.get(self.control.state.remote(self.step))
             except Exception as exc:
                 error = exc
                 phase, timestamp = OverlapActorControl.CANCELLED, 0
-            self.status[0], self.status[1] = phase, timestamp
+                done = total = 0
+            self.status[:] = torch.tensor((phase, timestamp, done, total), dtype=torch.float64, device=self.device)
         dist.broadcast(self.status, src=self.source, group=self.group)
-        phase, timestamp = self.status.tolist()
+        phase, timestamp, self.done, self.total = self.status.tolist()
         if int(phase) == OverlapActorControl.CANCELLED:
             raise RuntimeError("overlap_actor step cancelled or control unavailable") from error
         if int(phase) == OverlapActorControl.FULL and not self.full:
@@ -188,9 +230,21 @@ class OverlapActorExecution:
                 raise RuntimeError("overlap_actor full phase still has an SM limit")
             self.full = True
             self.signal_ts, self.full_ts = timestamp, time.time()
+        if not self.full:
+            from adaptive_schedule import choose_sms
+
+            selected = choose_sms(self.policy, self.active_sms, self.max_tokens, self.done, self.total)
+            if selected != self.active_sms:
+                previous = self.limited
+                self.active_sms, self.limited = selected, self.streams[selected]
+                self.limited.wait_stream(previous)
 
     @contextmanager
     def microbatch(self, data=None):
+        tokens = 0 if data is None else sum(x.numel() for x in data["input_ids"].unbind())
+        maximum = torch.tensor(tokens, dtype=torch.int64, device=self.device)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=self.group)
+        self.max_tokens = int(maximum.item())
         self._phase()
         if self.full:
             self.full_microbatches += 1
@@ -199,6 +253,7 @@ class OverlapActorExecution:
             return
         real_samples = 0 if data is None else sum(int(mask.any().item()) for mask in data["loss_mask"].unbind())
         self.limited.wait_stream(torch.cuda.current_stream())
+        started = time.time()
         try:
             with torch.cuda.stream(self.limited):
                 yield
@@ -209,11 +264,15 @@ class OverlapActorExecution:
             self.primary.wait_stream(self.limited)
         self.limited_microbatches += 1
         self.limited_completions.append((time.time(), real_samples))
+        self.mb_events.append(dict(sms=self.active_sms, max_rank_tokens=self.max_tokens,
+                                   students_done=int(self.done), start=started, end=time.time()))
 
     def finish(self, student_done_ts=None):
         self._phase()
         if not self.full:
             raise RuntimeError("overlap_actor cannot update parameters before the full-SM phase")
+        if self.pending_deferred_grads:
+            raise RuntimeError("Deferred gradients must synchronize in a full-phase backward before optimizer update")
         count = sum(n for timestamp, n in self.limited_completions if student_done_ts and timestamp < student_done_ts)
         completed = torch.tensor(count, device=self.device, dtype=torch.int64)
         dist.all_reduce(completed, group=self.group)
@@ -221,6 +280,9 @@ class OverlapActorExecution:
         switched = torch.tensor(self.full_ts, device=self.device, dtype=torch.float64)
         dist.all_reduce(switched, op=dist.ReduceOp.MAX, group=self.group)
         self.full_ts = switched.item()
+        print("adaptive_actor_trace=" + json.dumps(dict(step=self.step, rank=self.rank,
+              policy=self.policy, full_ts=self.full_ts, signal_ts=self.signal_ts,
+              limited=self.mb_events)), flush=True)
 
     def metrics(self):
         return {
@@ -231,4 +293,7 @@ class OverlapActorExecution:
             "overlap_actor/full_switch_ts": self.full_ts,
             "overlap_actor/full_switch_delay_s": self.full_ts - self.signal_ts,
             "overlap_actor/samples_completed_before_student": self.early_samples,
+            "overlap_actor/largest_limited_sms": self.active_sms,
+            "overlap_actor/longest_limited_mb_s": max((e["end"]-e["start"] for e in self.mb_events), default=0),
+            "overlap_actor/deferred_microbatches": self.deferred_microbatches,
         }

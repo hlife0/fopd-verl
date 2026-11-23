@@ -98,6 +98,22 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
 
+def overlap_microbatch_token_limit(data, original_limit, dp_group, target=4096):
+    """Agree on an atomic-sequence budget before entering FSDP collectives.
+
+    The balancing utility compares a global maximum length against this limit.
+    A rank-local limit would let some ranks raise while others enter its next
+    all-reduce. Make both the limit and an over-length failure collective.
+    """
+    longest = torch.tensor(max(x.numel() for x in data["input_ids"].unbind()),
+                           dtype=torch.int64, device=get_device_id())
+    torch.distributed.all_reduce(longest, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+    limit = max(target, int(longest.item()))
+    if limit > int(original_limit):
+        raise ValueError("A sequence exceeds the original Actor token budget on at least one rank")
+    return limit
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -699,11 +715,24 @@ class FSDPEngine(BaseEngine):
             "use_no_sync_for_gradient_accumulation",
             True,
         )
-        if is_last_micro_batch or not defer_sync:
+        execution = getattr(self, "overlap_actor_execution", None)
+        phase_deferred = execution is not None and execution.policy in ("defer-limited", "defer128", "split32", "split32-hint", "wide64", "wide128", "drain64")
+        # compute_ctx enters first and makes the rank-consistent FULL decision.
+        # Under this policy, even a chunk's final LIMITED backward retains full
+        # gradients. The first FULL backward reduces the accumulated gradients.
+        synchronize = execution.full if phase_deferred else (is_last_micro_batch or not defer_sync)
+        if synchronize:
             yield
+            if phase_deferred:
+                execution.pending_deferred_grads = False
             return
 
         version = fsdp_version(self.module)
+        if phase_deferred:
+            if version != 1:
+                raise ValueError("Phase-deferred gradient experiment currently validates FSDP1 only")
+            execution.pending_deferred_grads = True
+            execution.deferred_microbatches += 1
         if version == 1:
             with self.module.no_sync():
                 yield
@@ -756,9 +785,26 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
-        )
+        execution = None if forward_only else getattr(self, "overlap_actor_execution", None)
+        if execution is not None and execution.policy == "drain64":
+            # Select the now-available full-device token budget before forming
+            # microbatches, rather than promoting only after small batches exist.
+            execution._phase()
+        original_limit = None
+        if execution is not None and getattr(execution, "policy", None) and not execution.full:
+            original_limit = data["max_token_len_per_gpu"]
+            # Samples remain atomic. A long sequence raises the cap rather
+            # than truncating context or changing its training loss.
+            target = getattr(execution, "token_limit", 8192 if execution.policy in ("wide64", "wide128", "keep64", "drain64") else 4096)
+            limit = overlap_microbatch_token_limit(data, original_limit, self.get_data_parallel_group(), target=target)
+            tu.assign_non_tensor(data, max_token_len_per_gpu=limit)
+        try:
+            micro_batches, indices = prepare_micro_batches(
+                data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            )
+        finally:
+            if original_limit is not None:
+                tu.assign_non_tensor(data, max_token_len_per_gpu=original_limit)
 
         output_lst = []
 
