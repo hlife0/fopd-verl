@@ -85,48 +85,25 @@ class PPOTrainerSync(PPOTrainer):
     def _publish_actor_weights(self):
         if not getattr(self, "teacher_shared_actor", False):
             return self.checkpoint_manager.update_weights(self.global_steps)
-        # Initial checkpoint publication runs before fit() creates per-step timers.
-        timing_raw = getattr(self, "timing_raw", {})
         pending_sleep = getattr(self, "_pending_vllm_sleep", ())
         if pending_sleep:
             # Training has already finished. Join only before waking inference
             # so a late sleep cannot release memory after weights are restored.
-            with marked_timer("vllm_sleep_wait", timing_raw, color="red"):
+            with marked_timer("vllm_sleep_wait", self.timing_raw, color="red"):
                 for future in pending_sleep:
                     future.result()
             self._pending_vllm_sleep = ()
             if self._stop_rollout_profile_after_sleep:
                 self._stop_rollout_profiling()
                 self._stop_rollout_profile_after_sleep = False
-        # Restore only the Student weight allocation (and its old contents for
-        # level-1 sleep) while every Actor rank participates in FSDP export.
+        # Colocated inference processes sleep at level 1. Restore just the
+        # Student weights while every Actor rank participates in FSDP export.
         # Teacher stays asleep until Actor export/offload is complete.
-        with marked_timer("shared_student_weights_wake", timing_raw):
-            self.checkpoint_manager.wake_up_replicas(tags=["weights"])
-        with marked_timer("shared_publish", timing_raw):
-            metrics = self.checkpoint_manager.update_weights(self.global_steps)
-        with marked_timer("shared_actor_offload", timing_raw):
-            self.actor_rollout_wg.to("cpu")
-
-        def wake_student():
-            with marked_timer("shared_student_kv_wake", timing_raw):
-                self.checkpoint_manager.wake_up_replicas(tags=["kv_cache"])
-
-        def wake_teacher():
-            with marked_timer("shared_teacher_wake", timing_raw):
-                self.teacher_model_manager.wake_up()
-
-        with marked_timer("shared_inference_wake", timing_raw):
-            if getattr(self, "teacher_shared_actor_optimize", False):
-                # Disjoint GPUs, after all Actor ranks release export memory.
-                # Join both futures even if one fails before returning to rollout.
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    wakes = [pool.submit(wake_student), pool.submit(wake_teacher)]
-                    for future in wakes:
-                        future.result()
-            else:
-                wake_student()
-                wake_teacher()
+        self.checkpoint_manager.wake_up_replicas(tags=["weights"])
+        metrics = self.checkpoint_manager.update_weights(self.global_steps)
+        self.actor_rollout_wg.to("cpu")
+        self.checkpoint_manager.wake_up_replicas(tags=["kv_cache"])
+        self.teacher_model_manager.wake_up()
         return metrics
 
     def step(self, metrics: dict, timing_raw: dict):
@@ -150,7 +127,6 @@ class PPOTrainerSync(PPOTrainer):
             metrics["teacher_shared_actor/no_wait_sleep"] = int(
                 getattr(self, "teacher_shared_actor_no_wait_sleep", False)
             )
-            metrics["teacher_shared_actor/optimize"] = int(getattr(self, "teacher_shared_actor_optimize", False))
         if getattr(self, "early_actor_plus", False):
             metrics["early_actor_plus/enabled"] = 1
         return batch
@@ -275,17 +251,7 @@ class PPOTrainerSync(PPOTrainer):
         if getattr(self, "overlap_actor", False):
             return self._stream_overlap_actor(metrics, timing_raw, sample_batch_size)
         if not self.early_actor_lite:
-            if not getattr(self, "teacher_shared_actor_optimize", False):
-                return super()._step_once(metrics, timing_raw, sample_batch_size)
-            # All Teacher scores remain required. Match early-Actor's polling
-            # cadence instead of leaving shared Actor idle for up to 2 seconds
-            # after the batch is already complete.
-            previous_poll = self.replay_buffer.poll_interval
-            self.replay_buffer.poll_interval = min(previous_poll, 0.05)
-            try:
-                return super()._step_once(metrics, timing_raw, sample_batch_size)
-            finally:
-                self.replay_buffer.poll_interval = previous_poll
+            return super()._step_once(metrics, timing_raw, sample_batch_size)
 
         sessions_per_prompt = int(self.config.actor_rollout_ref.rollout.n)
         leftover_poll = self.replay_buffer.poll_interval
@@ -374,6 +340,12 @@ class PPOTrainerSync(PPOTrainer):
         return batch
 
     def _stream_overlap_actor(self, metrics, timing_raw, sample_batch_size):
+        from adaptive_schedule import choose_chunk
+        from overlap_sleep import SleepCall
+        from tail_coalescing import LastBatchCoalescer
+
+        policy = os.environ["FOPD_ADAPTIVE_POLICY"]
+        last_published = -1
         prompt_uids = self._overlap_prompt_uids
         if len(prompt_uids) != sample_batch_size:
             raise RuntimeError("overlap_actor logical batch differs from submitted prompts")
@@ -382,6 +354,8 @@ class PPOTrainerSync(PPOTrainer):
         consumed, padding_keys, events = set(), [], []
         started = finalized = students_asleep = False
         pending = event = None
+        sleep_call = SleepCall(os.environ.get("FOPD_TAIL_ASYNC_SLEEP") == "1")
+        coalescer = LastBatchCoalescer(float(os.environ.get("FOPD_TAIL_WAIT_S", "0.1")))
         take = []
         interval = min(self.replay_buffer.poll_interval, 0.01)
         gen_start = time.time()
@@ -407,12 +381,24 @@ class PPOTrainerSync(PPOTrainer):
                     prompt_uids,
                     self.global_steps,
                 )
+                readiness_snapshot_ts = time.time()
+                if len(students.keys) != last_published:
+                    last_published = len(students.keys)
+                    self._overlap_control.progress.remote(self.global_steps, last_published, sample_batch_size)
                 if len(students.keys) == sample_batch_size and not students_asleep:
                     self._trace_student_barrier_ts = time.time()
+                    # All generation results are published. Compute can expand
+                    # while vLLM releases its cache; update/publish still joins
+                    # on_sample_end before reaching finish_actor_accumulate.
+                    ray.get(self._overlap_control.full.remote(self.global_steps))
                     self._trace_sleep_start_ts = time.time()
-                    self.on_sample_end()
+                    sleep_call.start(self.on_sample_end)
                     timing_raw["gen"] = time.time() - gen_start
                     students_asleep = True
+                    if policy == "drain64":
+                        # Sleep can take hundreds of milliseconds while Teacher
+                        # publishes new losses. Refresh the ready set afterwards.
+                        continue
                 if pending is not None:
                     if not pending.done():
                         time.sleep(interval)
@@ -425,10 +411,19 @@ class PPOTrainerSync(PPOTrainer):
                     if len(consumed) == sample_batch_size:
                         break
                 ready = [key for key in ready if key not in consumed]
-                if not ready or (not started and not students_asleep and len(ready) < dp_size):
+                if policy == "drain64" and coalescer.should_wait(
+                    ready=len(ready), remaining=sample_batch_size - len(consumed),
+                    dp=dp_size, asleep=students_asleep, now=time.monotonic(),
+                ):
                     time.sleep(interval)
                     continue
-                take = ready
+                selected = choose_chunk(ready, policy=policy, started=started,
+                                        done=len(students.keys), total=sample_batch_size,
+                                        dp=dp_size, asleep=students_asleep)
+                if not selected:
+                    time.sleep(interval)
+                    continue
+                take = selected
                 chunk = students.select_keys(take)
                 if chunk.extra_info is None:
                     chunk.extra_info = {}
@@ -448,6 +443,10 @@ class PPOTrainerSync(PPOTrainer):
                     started = True
                 event = {
                     "n": len(take),
+                    "sample_keys": list(take),
+                    "readiness_snapshot_ts": readiness_snapshot_ts,
+                    "tail_coalesce_elapsed_s": coalescer.last_elapsed_s,
+                    "tail_coalesce_timeout": coalescer.timed_out,
                     "teacher_ready_when_dispatched": len(ready),
                     "students_done_when_dispatched": len(students.keys),
                     "leftover_when_dispatched": sample_batch_size - len(consumed) - len(take),
@@ -458,6 +457,11 @@ class PPOTrainerSync(PPOTrainer):
             batch = self.replay_buffer.materialize_actor_overlap_batch("train", prompt_uids, self.global_steps)
             if not students_asleep:
                 raise RuntimeError("overlap_actor cannot finish before the Student barrier")
+            sleep_join_start = time.perf_counter()
+            sleep_call.join()
+            metrics["overlap_actor/sleep_join_s"] = time.perf_counter() - sleep_join_start
+            metrics["overlap_actor/coalesce_polls"] = coalescer.polls
+            metrics["overlap_actor/coalesce_timeout"] = int(coalescer.timed_out)
             self._trace_actor_finish_start_ts = time.time()
             last_student = max(float(tag["student_gen_done_ts"]) for tag in batch.tags)
             output = _first_output(self.actor_rollout_wg.finish_actor_accumulate(student_done_ts=last_student))
@@ -471,8 +475,11 @@ class PPOTrainerSync(PPOTrainer):
             finally:
                 executor.shutdown(wait=True)
                 try:
-                    if started and not finalized:
-                        self.actor_rollout_wg.abort_actor_accumulate()
+                    try:
+                        sleep_call.join()
+                    finally:
+                        if started and not finalized:
+                            self.actor_rollout_wg.abort_actor_accumulate()
                 finally:
                     if padding_keys:
                         tq.kv_clear(partition_id="train", keys=padding_keys)
@@ -716,7 +723,7 @@ class PPOTrainerSync(PPOTrainer):
         self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
-            self._pending_sync_metrics = self._publish_actor_weights()
+            self._publish_actor_weights()
         self._trace_weights_done_ts = time.time()
 
     def on_sample_end(self):
