@@ -15,22 +15,50 @@ from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension 
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 
-def test_server_kv_only_sleep_never_calls_full_sleep_or_weight_wake():
+def _kv_only_server(request_states=None):
+    calls = []
+
+    def record(name):
+        return AsyncMock(side_effect=lambda *args, **kwargs: calls.append((name, *args)))
+
     engine = SimpleNamespace(
-        sleep=AsyncMock(), wake_up=AsyncMock(), collective_rpc=AsyncMock(), reset_prefix_cache=AsyncMock()
+        sleep=record("sleep"), wake_up=record("wake_up"), collective_rpc=record("collective_rpc"),
+        reset_prefix_cache=record("reset_prefix_cache"), pause_generation=record("pause_generation"),
+        resume_generation=record("resume_generation"),
+        output_processor=SimpleNamespace(request_states=dict(request_states or {})),
     )
     server = SimpleNamespace(
         node_rank=0, rollout_mode=RolloutMode.COLOCATED,
         config=SimpleNamespace(free_cache_engine=True, sleep_keep_weights=True), engine=engine,
     )
+    return server, calls
+
+
+def test_server_kv_only_sleep_never_calls_full_sleep_or_weight_wake():
+    server, calls = _kv_only_server()
+    engine = server.engine
     asyncio.run(vLLMHttpServer.sleep(server))
     engine.collective_rpc.assert_awaited_once_with("sleep_kv_cache_only")
     asyncio.run(vLLMHttpServer.wake_up(server, tags=["weights"]))
     assert engine.collective_rpc.await_count == 1
+    engine.resume_generation.assert_not_awaited()
     asyncio.run(vLLMHttpServer.wake_up(server))
     assert engine.collective_rpc.await_args.args == ("wake_kv_cache_only",)
     engine.sleep.assert_not_awaited()
     engine.wake_up.assert_not_awaited()
+    assert [call[0] for call in calls] == [
+        "pause_generation", "collective_rpc", "collective_rpc", "reset_prefix_cache", "resume_generation",
+    ]
+
+
+def test_server_kv_only_sleep_aborts_requests_before_freeing_kv():
+    # A request still in flight at sleep, e.g. an overtaken follow hop, must be aborted
+    # before the KV cache is unmapped, and new requests wait until the KV cache is back.
+    server, calls = _kv_only_server(request_states={"orphan-hop": object()})
+    asyncio.run(vLLMHttpServer.sleep(server))
+    assert calls[0] == ("pause_generation",)
+    server.engine.pause_generation.assert_awaited_once_with(wait_for_inflight_requests=False, clear_cache=True)
+    assert calls[1] == ("collective_rpc", "sleep_kv_cache_only")
 
 
 def test_kv_only_worker_maps_only_kv_and_retries_failed_mapping(monkeypatch):

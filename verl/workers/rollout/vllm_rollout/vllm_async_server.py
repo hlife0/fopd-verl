@@ -901,6 +901,8 @@ class vLLMHttpServer:
             if tags is None or "kv_cache" in tags:
                 await self.engine.collective_rpc("wake_kv_cache_only")
                 await self.engine.reset_prefix_cache(reset_connector=True)
+                # Sleep paused the scheduler; requests added since then are scheduled from here.
+                await self.engine.resume_generation()
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -925,9 +927,16 @@ class vLLMHttpServer:
             return
 
         if getattr(self.config, "sleep_keep_weights", False):
-            # The replica drains all requests before reaching this method.
-            # Drop cached block references before their physical memory is freed.
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            # vLLM's own sleep pauses the scheduler and aborts in-flight requests before
+            # freeing memory; freeing only the KV cache here needs the same. The replica's
+            # drain wait does not cover it, since with DP=1 it returns at once. A Teacher
+            # can still hold requests at this point, for example a follow hop whose client
+            # task was cancelled after the final request overtook it, and a step scheduled
+            # on the freed KV cache kills the engine. The pause also clears the prefix cache.
+            in_flight = len(self.engine.output_processor.request_states)
+            if in_flight:
+                logger.warning("KV-only sleep: aborting %d in-flight request(s)", in_flight)
+            await self.engine.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
             await self.engine.collective_rpc("sleep_kv_cache_only")
             return
 
