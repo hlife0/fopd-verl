@@ -1,3 +1,4 @@
+from verl.utils import readiness_batching as rb
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -188,6 +189,7 @@ class ReplayBuffer:
             raise ValueError("sync_refill_failed_groups requires gen_batch_size=1")
 
     def _sync_metadata_from_transfer_queue(self):
+        rb.snapshot_begin(self)
         """Sync the metadata from TransferQueue."""
         self.partitions.clear()
         self.pending_keys.clear()
@@ -222,6 +224,7 @@ class ReplayBuffer:
                     if key not in partition:
                         partition[key] = {}
                     partition[key].update(tag)
+        rb.observe(self)
 
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:
@@ -433,6 +436,7 @@ class ReplayBuffer:
             self._sync_metadata_from_transfer_queue()
             ready = self._student_ready_prompt_uids(partition_id, sessions_per_prompt)
             if len(ready) >= batch_size:
+                rb.student_barrier(self, ready)
                 return ready
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
 
