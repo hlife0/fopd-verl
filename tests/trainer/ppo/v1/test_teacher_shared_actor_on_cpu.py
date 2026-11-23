@@ -200,7 +200,8 @@ def test_no_wait_dispatches_actor_while_sleep_is_pending(config, blocked, oom):
     trainer._record_gen_split_timing = lambda *args: None
     trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=[])
     trainer._balance_batch = lambda batch, **kwargs: batch
-    trainer._actor_update_extra_info = lambda: {}
+    trainer._actor_dp_size = lambda: config.trainer.n_gpus_per_node + config.distillation.n_gpus_per_node
+    trainer._actor_update_extra_info = lambda: {"mini_batch_size": 48}
     trainer._apply_actor_update_metrics = lambda *args: None
     failure = torch.OutOfMemoryError("simulated Actor OOM")
 

@@ -1720,10 +1720,18 @@ class PPOTrainer(ABC):
             required_multiple = math.lcm(required_multiple, critic_global_mini_batch_size)
 
         # If there is an actor update, the batch should align with actor PPO mini-batches too.
+        # A full-batch minibatch that is not divisible by dp (128 on 6 GPUs) cannot be
+        # repaired by lcm(dp, minibatch): that pads far past the batch and the worker
+        # still rejects the original minibatch. Pad only to dp; the update uses that length.
         if self.config.trainer.critic_warmup <= self.global_steps:
             actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
-            required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
+            train_global = int(self.config.data.train_batch_size) * int(self.config.actor_rollout_ref.rollout.n)
+            full_batch_needs_dp_pad = (
+                actor_global_mini_batch_size == train_global and actor_global_mini_batch_size % dp_size != 0
+            )
+            if not full_batch_needs_dp_pad:
+                required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
 
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
@@ -1996,7 +2004,26 @@ class PPOTrainer(ABC):
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
-        batch.extra_info.update(self._actor_update_extra_info())
+        extra = self._actor_update_extra_info()
+        dp_size = self._actor_dp_size()
+        configured = extra["mini_batch_size"]
+        train_global = int(self.config.data.train_batch_size) * int(self.config.actor_rollout_ref.rollout.n)
+        if configured == train_global and configured % dp_size != 0:
+            padded = len(batch)
+            if padded % dp_size != 0:
+                raise ValueError(
+                    f"full-batch update of {configured} samples on dp={dp_size} padded to {padded}, "
+                    "which is still not divisible by dp"
+                )
+            logger.info(
+                "full-batch update uses padded mini-batch %d (configured %d, dp %d)",
+                padded,
+                configured,
+                dp_size,
+            )
+            extra["mini_batch_size"] = padded
+            extra["global_batch_size"] = padded
+        batch.extra_info.update(extra)
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
         self._apply_actor_update_metrics(output, metrics)
         return batch
