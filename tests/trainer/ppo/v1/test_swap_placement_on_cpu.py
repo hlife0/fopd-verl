@@ -306,7 +306,25 @@ def test_swap_placement_requires_the_teacher_to_span_the_student_gpus():
         _validator(config)._validate_swap_placement()
 
 
-def test_teacher_on_student_gpus_without_swap_is_rejected():
+def test_fused_inference_uses_the_trainer_gpus_only():
+    from verl.trainer.ppo.utils import Role
+
+    config = _swap_config(swap_placement="false", fused_inference="true")
+    trainer = _validator(config)
+    trainer._init_resource_pool_mgr()
+    assert trainer.resource_pool_manager.resource_pool_spec == {"global_pool": [3]}
+    assert trainer.mapping[Role.TeacherModel] == "global_pool"
+    trainer.actor_rollout_wg = type("WG", (), {"world_size": 3})()
+    trainer._configure_early_actor_lite()
+    assert trainer.early_actor_lite is True
+    assert trainer.early_actor_stream_fb is False
+
+
+def test_fused_inference_rejects_a_teacher_that_does_not_span_the_node():
+    config = _swap_config(swap_placement="false", fused_inference="true")
+    config.distillation.teacher_models.teacher_model.inference.pipeline_model_parallel_size = 2
+    with pytest.raises(ValueError, match="TP \\* DP \\* PP"):
+        _validator(config)._init_resource_pool_mgr()
     config = _swap_config(swap_placement="false")
     with pytest.raises(ValueError, match="teacher_placement=student requires"):
         _validator(config)._init_resource_pool_mgr()

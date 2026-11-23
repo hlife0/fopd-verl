@@ -385,7 +385,9 @@ class PPOTrainer(ABC):
                 resource_pool=teacher_resource_pool,
                 # Swap placement starts the Teacher across the Student GPUs before the Student
                 # engine, which then sees the Teacher's memory as used.
-                gpus_per_node=self.config.trainer.n_gpus_per_node if self.swap_placement else None,
+                gpus_per_node=(
+                    self.config.trainer.n_gpus_per_node if self.swap_placement or self.fused_inference else None
+                ),
             )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
             if self.teacher_shared_actor:
@@ -910,10 +912,18 @@ class PPOTrainer(ABC):
         if self.teacher_shared_actor:
             self._validate_teacher_shared_actor()
         self.swap_placement = bool(OmegaConf.select(config, "trainer.v1.sync.swap_placement", default=False))
+        self.fused_inference = bool(OmegaConf.select(config, "trainer.v1.sync.fused_inference", default=False))
+        if self.fused_inference and self.swap_placement:
+            raise ValueError("fused_inference and swap_placement cannot both be set")
         if self.swap_placement:
             self._validate_swap_placement()
+        elif self.fused_inference:
+            self._validate_fused_inference()
         elif OmegaConf.select(config, "distillation.teacher_placement", default="dedicated") == "student":
-            raise ValueError("distillation.teacher_placement=student requires trainer.v1.sync.swap_placement=True")
+            raise ValueError(
+                "distillation.teacher_placement=student requires "
+                "trainer.v1.sync.swap_placement=True or trainer.v1.sync.fused_inference=True"
+            )
         # role => worker class
         self.role_worker_mapping = {}
         # role => resource pool
@@ -969,6 +979,9 @@ class PPOTrainer(ABC):
             elif self.swap_placement:
                 # The Teacher runs on the Student GPUs; the distillation GPUs host the peer Actor.
                 resource_pool_spec["swap_peer_pool"] = teacher_pool
+                self.mapping[Role.TeacherModel] = global_pool_id
+            elif self.fused_inference:
+                # Student, Teacher, and the Actor share trainer.n_gpus_per_node. No peer pool.
                 self.mapping[Role.TeacherModel] = global_pool_id
             else:
                 resource_pool_spec["teacher_pool"] = teacher_pool
@@ -1088,6 +1101,49 @@ class PPOTrainer(ABC):
             if inference.name != "vllm" or size != config.trainer.n_gpus_per_node:
                 raise ValueError(
                     "swap_placement runs one vLLM Teacher replica across the Student GPUs: "
+                    "Teacher TP * DP * PP must equal trainer.n_gpus_per_node"
+                )
+
+    def _validate_fused_inference(self):
+        """All trainer GPUs run Student decode and one Teacher replica, then one FSDP update."""
+        config = self.config
+        sync = config.trainer.v1.sync
+        rollout = config.actor_rollout_ref.rollout
+        distillation = config.get("distillation")
+        if config.trainer.v1.trainer_mode != "sync" or not is_distillation_enabled(distillation):
+            raise ValueError("fused_inference requires synchronous distillation")
+        if distillation.get("teacher_placement", "dedicated") != "student":
+            raise ValueError("fused_inference requires distillation.teacher_placement=student")
+        if config.trainer.nnodes != 1 or distillation.nnodes != 1:
+            raise ValueError("fused_inference currently requires a single node")
+        if any(
+            sync.get(key, False)
+            for key in ("teacher_shared_actor", "overlap_actor", "actor_rollout_overlap", "swap_placement")
+        ):
+            raise ValueError("fused_inference replaces teacher-shared, overlap, and swap placement")
+        if not sync.get("opd_no_task_reward_fast_path", False):
+            raise ValueError("fused_inference requires the OPD no-task-reward fast path")
+        if self.use_critic or self.use_reference_policy or config.reward.reward_model.enable:
+            raise ValueError("fused_inference requires no critic, reference policy, or reward model")
+        actor = config.actor_rollout_ref.actor
+        if actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("fused_inference requires FSDP1 or FSDP2")
+        if int(rollout.n) != 1 or rollout.name != "vllm" or rollout.get("disaggregation", {}).get("enabled", False):
+            raise ValueError("fused_inference requires vLLM rollout.n=1 without disaggregated prefill/decode")
+        student_gpus = int(config.trainer.n_gpus_per_node)
+        student_tp = int(rollout.tensor_model_parallel_size)
+        if student_tp <= 0 or student_gpus % student_tp != 0:
+            raise ValueError("fused_inference requires Student TP to divide trainer.n_gpus_per_node")
+        for teacher in distillation.teacher_models.values():
+            inference = teacher.inference
+            size = (
+                inference.tensor_model_parallel_size
+                * inference.data_parallel_size
+                * inference.pipeline_model_parallel_size
+            )
+            if inference.name != "vllm" or size != student_gpus:
+                raise ValueError(
+                    "fused_inference runs one vLLM Teacher replica across every trainer GPU: "
                     "Teacher TP * DP * PP must equal trainer.n_gpus_per_node"
                 )
 

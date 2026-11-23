@@ -40,7 +40,8 @@ teacher_follow_async_scheduling: true
 
 # "dedicated": Teacher on its own pool (n_gpus_per_node * nnodes). "student": one Teacher
 # replica on the Student rollout GPUs, usually pipeline parallel across them
-# (trainer.v1.sync.swap_placement); the distillation pool then hosts no Teacher.
+# (trainer.v1.sync.swap_placement or fused_inference). With swap_placement the
+# distillation pool hosts the peer Actor. With fused_inference there is no second pool.
 teacher_placement: dedicated
 
 # With teacher_placement=student: run the Teacher on the first N SMs of each GPU through a
