@@ -352,3 +352,26 @@ def test_distillation_config_for_student_placement():
     # Hydra instantiation wraps the ValueError.
     with pytest.raises(Exception, match="teacher_green_sms needs teacher_placement"):
         omega_conf_to_dataclass(config.distillation)
+
+
+@pytest.mark.parametrize("keep_teacher", [False, True])
+@pytest.mark.parametrize("initial", [False, True])
+def test_fused_publication_sleeps_the_teacher_unless_kept(monkeypatch, keep_teacher, initial):
+    from types import SimpleNamespace
+
+    if keep_teacher:
+        monkeypatch.setenv("FOPD_PUBLISH_KEEP_TEACHER", "1")
+    else:
+        monkeypatch.delenv("FOPD_PUBLISH_KEEP_TEACHER", raising=False)
+    events = []
+    trainer = PPOTrainerSync.__new__(PPOTrainerSync)
+    trainer.fused_inference = True
+    trainer.global_steps = 3
+    if not initial:
+        trainer.timing_raw = {}
+    trainer.teacher_model_manager = SimpleNamespace(
+        sleep=lambda: events.append("teacher_sleep"), wake_up=lambda: events.append("teacher_wake")
+    )
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda step: events.append("publish") or {"m": step})
+    assert trainer._publish_actor_weights() == {"m": 3}
+    assert events == (["publish"] if keep_teacher else ["teacher_sleep", "publish", "teacher_wake"])

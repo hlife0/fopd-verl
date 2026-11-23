@@ -116,6 +116,10 @@ class PPOTrainerSync(PPOTrainer):
 
     def _publish_actor_weights(self):
         if getattr(self, "fused_inference", False) and self.teacher_model_manager is not None:
+            if os.environ.get("FOPD_PUBLISH_KEEP_TEACHER") == "1":
+                # The Teacher stays awake: each GPU then holds the Actor's export memory,
+                # the Teacher and the sleeping Student at once.
+                return self.checkpoint_manager.update_weights(self.global_steps)
             # Student KV is remapped onto the same GPUs the Teacher still holds.
             # Release the Teacher first, publish, then bring the Teacher back.
             timing = getattr(self, "timing_raw", None)
