@@ -96,6 +96,24 @@ def test_kv_only_worker_maps_only_kv_and_retries_failed_mapping(monkeypatch):
     worker.model_runner.post_kv_cache_wake_up.assert_called_once()
 
 
+def test_sleep_memory_assert_is_logged_only_for_the_free_memory_check(monkeypatch):
+    from vllm.v1.worker import gpu_worker
+
+    from verl.workers.rollout.vllm_rollout.utils import tolerate_vllm_sleep_memory_assert
+
+    errors = iter([AssertionError("Memory usage increased after sleeping."), AssertionError("other")])
+
+    def sleep(self, level=1):
+        raise next(errors)
+
+    monkeypatch.setattr(gpu_worker.Worker, "sleep", sleep)
+    tolerate_vllm_sleep_memory_assert()
+    tolerate_vllm_sleep_memory_assert()  # Installing twice does not wrap twice.
+    assert gpu_worker.Worker.sleep(object()) is None
+    with pytest.raises(AssertionError, match="other"):
+        gpu_worker.Worker.sleep(object())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_real_cumem_releases_kv_retains_weights_and_preserves_forward():
     from vllm.device_allocator.cumem import CuMemAllocator
