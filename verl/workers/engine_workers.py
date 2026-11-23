@@ -1113,8 +1113,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 metrics["weight_publication/send_s"] = time.perf_counter() - export_done
             return metrics or {}
 
+        # FOPD_ACTOR_KEEP_CACHE=1: the Actor keeps its cached GPU memory through publication
+        # (only gc runs) instead of unmapping it here and mapping it again in the next update.
+        # The GPUs must then hold the Actor's cache next to the colocated inference engines.
+        keep_cache = os.getenv("FOPD_ACTOR_KEEP_CACHE") == "1"
         set_expandable_segments(False)
-        aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
+        if keep_cache:
+            gc.collect()
+        else:
+            aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
@@ -1164,8 +1171,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # cache, and wait for every colocated Actor rank to do the same.
             # Publication optimization needs this for normal/early Actor too.
             get_torch_device().synchronize()
-            get_torch_device().empty_cache()
+            if not keep_cache:
+                get_torch_device().empty_cache()
             torch.distributed.barrier(group=self.actor.engine.get_data_parallel_group())
+        elif keep_cache:
+            gc.collect()
         else:
             aggressive_empty_cache(force_sync=True)
 
@@ -1175,7 +1185,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
-        set_expandable_segments(True)
+        # FOPD_ACTOR_NO_EXPANDABLE=1: keep expandable segments off after the first publication
+        # too; releasing them in the publication's empty_cache is slow under MPS.
+        if os.getenv("FOPD_ACTOR_NO_EXPANDABLE") != "1":
+            set_expandable_segments(True)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
