@@ -756,9 +756,21 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
-        )
+        execution = None if forward_only else getattr(self, "overlap_actor_execution", None)
+        original_limit = None
+        if execution is not None and getattr(execution, "policy", None) and not execution.full:
+            original_limit = data["max_token_len_per_gpu"]
+            # Samples remain atomic. A long sequence raises the cap rather
+            # than truncating context or changing its training loss.
+            longest = max(x.numel() for x in data["input_ids"].unbind())
+            tu.assign_non_tensor(data, max_token_len_per_gpu=min(original_limit, max(4096, longest)))
+        try:
+            micro_batches, indices = prepare_micro_batches(
+                data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            )
+        finally:
+            if original_limit is not None:
+                tu.assign_non_tensor(data, max_token_len_per_gpu=original_limit)
 
         output_lst = []
 
