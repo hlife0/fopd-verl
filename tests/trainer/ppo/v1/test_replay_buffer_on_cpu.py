@@ -1519,11 +1519,13 @@ def test_actor_overlap_waits_for_real_async_tq_publication(tq_init, partition_id
 
     def producer():
         try:
-            tq.kv_batch_put(
-                keys=["active_0_0"],
-                partition_id=partition_id,
-                fields=TensorDict({"input_ids": torch.tensor([[1, 2, 3]])}, batch_size=[1]),
-                tags=[{"global_steps": 3, "seq_len": 3, "student_gen_done_ts": 1.0}],
+            asyncio.run(
+                tq.async_kv_batch_put(
+                    keys=["active_0_0"],
+                    partition_id=partition_id,
+                    fields=TensorDict({"input_ids": torch.tensor([[1, 2, 3]])}, batch_size=[1]),
+                    tags=[{"global_steps": 3, "seq_len": 3, "student_gen_done_ts": 1.0}],
+                )
             )
         except Exception as exc:
             errors.append(exc)
