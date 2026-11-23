@@ -26,6 +26,7 @@ the uncached suffix.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Optional
 
 import torch
@@ -147,7 +148,8 @@ def follow_submit_len(
 
     While Student is decoding, send whole KV blocks plus one token (see
     FOLLOW_KV_BLOCK_SIZE); the rest waits. After Student finishes, send the
-    remaining full prefix.
+    remaining full prefix. With FOPD_FOLLOW_MIN_HOP=N, a mid-follow hop also
+    waits until it carries at least N new tokens.
     """
     if seq_len <= scored_seq_len:
         return 0
@@ -155,6 +157,8 @@ def follow_submit_len(
         return seq_len
     blocks = (seq_len - 1) // block_size * block_size
     if blocks == 0 or blocks + 1 <= scored_seq_len:
+        return 0
+    if blocks + 1 - scored_seq_len < int(os.environ.get("FOPD_FOLLOW_MIN_HOP") or 0):
         return 0
     return blocks + 1
 

@@ -167,6 +167,18 @@ def test_should_submit_follow_aligns_to_kv_block():
     assert follow_submit_len(53, student_done=True, scored_seq_len=49) == 53
 
 
+def test_follow_min_hop_delays_only_mid_follow_hops(monkeypatch):
+    monkeypatch.setenv("FOPD_FOLLOW_MIN_HOP", "32")
+    # 17 and 33 new tokens: the first hop waits, the second is sent.
+    assert follow_submit_len(45, student_done=False, scored_seq_len=16) == 0
+    assert follow_submit_len(50, student_done=False, scored_seq_len=16) == 49
+    assert _should_submit_follow(17, student_done=False, scored_seq_len=0) is False
+    # The final request after the Student finishes is unchanged.
+    assert follow_submit_len(20, student_done=True, scored_seq_len=16) == 20
+    monkeypatch.setenv("FOPD_FOLLOW_MIN_HOP", "0")
+    assert follow_submit_len(45, student_done=False, scored_seq_len=16) == 33
+
+
 def test_follow_sampling_params_enable_prefix_read():
     teacher_cfg = type("T", (), {"inference": type("I", (), {"temperature": 1.0})()})()
     loss_cfg = type(
