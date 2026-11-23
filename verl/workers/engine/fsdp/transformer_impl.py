@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from contextlib import contextmanager, nullcontext
 from inspect import signature
@@ -39,7 +40,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -60,6 +61,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.metric.utils import Metric
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.seqlen_balancing import ceildiv
@@ -768,6 +770,14 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
+        # Opt-in measurement of the micro-batch F/B loop, including FSDP communication.
+        # Synchronize both boundaries so parameter loading and queued GPU work cannot
+        # leak into/out of this interval. Optimizer and output processing stay outside.
+        profile_fb = not forward_only and os.getenv("FOPD_PROFILE_ACTOR_FB") == "1"
+        if profile_fb:
+            get_torch_device().synchronize()
+            fb_start = time.perf_counter()
+
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
             execution = None if forward_only else getattr(self, "overlap_actor_execution", None)
             compute_ctx = execution.microbatch(micro_batch) if execution is not None else nullcontext()
@@ -797,8 +807,21 @@ class FSDPEngine(BaseEngine):
 
             output_lst.append(meta_info)
 
+        if profile_fb:
+            get_torch_device().synchronize()
+            fb_seconds = time.perf_counter() - fb_start
+
         # postprocess and return
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        output = postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        if profile_fb:
+            output["metrics"].update(
+                {
+                    "perf/fb_time_max_s": Metric("max", fb_seconds),
+                    "perf/fb_time_mean_s": Metric("mean", fb_seconds),
+                    "perf/fb_micro_batches_max": Metric("max", len(micro_batches)),
+                }
+            )
+        return output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
