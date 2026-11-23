@@ -15,6 +15,7 @@
 The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
+from verl.utils import opd_timeline
 import gc
 import logging
 import os
@@ -782,13 +783,16 @@ class FSDPEngine(BaseEngine):
             # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
             # when training, or directly under the stage for log-prob.
             with compute_ctx, ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                trace_fields = opd_timeline._call_fields({"self": self, "data": micro_batch}, "actor") if opd_timeline.enabled() else {}
+                with opd_timeline.span("actor.infer" if forward_only else "actor.forward", microbatch=micro_batch_idx, forward_only=forward_only, **trace_fields):
+                    loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    with opd_timeline.span("actor.backward", microbatch=micro_batch_idx, **trace_fields):
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
                     if not return_model_output:
                         # Standard training discards model_output (train_batch pops it); keeping it accumulates
                         # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
@@ -820,6 +824,7 @@ class FSDPEngine(BaseEngine):
             if parameter.grad is not None:
                 parameter.grad.mul_(factor)
 
+    @opd_timeline.observed("actor.optimizer", "actor", coarse=False)
     def optimizer_step(self):
         """
         Clip gradients, skip update if non-finite, and step optimizer.

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from verl.utils import opd_timeline
 import json
 import logging
 import math
@@ -1536,6 +1537,7 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        opd_timeline.rollout_submit(self.global_steps, batch)
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(
@@ -1912,6 +1914,7 @@ class PPOTrainer(ABC):
             output["perf/mfu/actor"] = output.pop("actor/mfu")
         metrics.update(reduce_metrics(output))
 
+    @opd_timeline.observed("actor.dispatch", "driver", coarse=False)
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         batch.extra_info.update(self._actor_update_extra_info())

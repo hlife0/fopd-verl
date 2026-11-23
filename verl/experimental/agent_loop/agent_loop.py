@@ -27,6 +27,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 - ...
 """
 
+from verl.utils import opd_timeline
 import asyncio
 import logging
 import os
@@ -660,6 +661,7 @@ class AgentLoopWorker:
         )
         return output
 
+    @opd_timeline.observed("trajectory", "agent", coarse=False)
     async def _run_agent_loop(
         self,
         sampling_params: dict[str, Any],
@@ -1044,6 +1046,7 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
+    @opd_timeline.observed("teacher.ready", "teacher", coarse=False)
     async def _compute_teacher_logprobs(
         self,
         output: AgentLoopOutput,
