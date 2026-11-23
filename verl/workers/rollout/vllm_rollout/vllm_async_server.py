@@ -160,7 +160,23 @@ class vLLMHttpServer:
             os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
         self.rollout_mode = rollout_mode
-        if self.config.sleep_keep_weights and (
+        experimental_student_keep = (
+            os.environ.get("FOPD_RETAIN_STUDENT_WEIGHTS") == "1"
+            and self.config.sleep_keep_weights
+            and (rollout_mode == RolloutMode.HYBRID or self.config.colocated_full_weight_sync)
+        )
+        if experimental_student_keep:
+            # Existing KV-only allocation methods are also valid for in-place
+            # full weight publication. Limit this experiment to the tested setup.
+            if (rollout_mode not in (RolloutMode.HYBRID, RolloutMode.COLOCATED)
+                or self.config.data_parallel_size != 1 or nnodes != 1
+                or self.config.tensor_model_parallel_size != 2
+                or self.model_config.hf_config.model_type != "qwen3"
+                or self.lora_as_adapter
+                or os.environ.get("OPD_ENABLE_SD", "0") != "0"):
+                raise ValueError("Resident Student experiment requires non-SD Qwen3 TP2/DP1 on one node")
+            logger.warning("Resident Student weights enabled: replica=%s mode=%s", replica_rank, rollout_mode)
+        elif self.config.sleep_keep_weights and (
             rollout_mode != RolloutMode.COLOCATED
             or self.config.data_parallel_size != 1
             or nnodes != 1
