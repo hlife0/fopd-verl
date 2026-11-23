@@ -18,6 +18,11 @@ VERL_GREEN_SMS=N
     The worker's streams run on the first N SMs, the group GreenContext.create(N) takes.
 VERL_GREEN_EXCLUDE_SMS=N
     The worker's streams run on the SMs left after the first N.
+FOPD_CUBLAS_SM_TARGET=N|green (off unless set)
+    Once the green streams are active, cublasSetSmCountTarget(N) on the worker's cuBLAS
+    handles, so cuBLAS sizes its grids for N SMs instead of the whole device; "green" uses
+    the green context's SM count. cuBLAS handles are per thread: set on the activating
+    thread and on each thread the first time it runs Worker.execute_model.
 
 Applied in each vLLM GPU worker right after its distributed environment is up, so the
 model runner's current stream and its CUDA graph capture streams are green streams;
@@ -34,6 +39,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _state: dict = {}
 _hooked: list = []
+_cublas: dict = {}
 
 
 def _check(result):
@@ -113,6 +119,43 @@ def activate_green_streams(mode: str, count: int) -> int:
     return _state["sms"]
 
 
+def _set_cublas_sm_target(count: int, where: str) -> None:
+    """cublasSetSmCountTarget(count) on the current thread's cuBLAS handle of the current stream."""
+    import ctypes
+    import threading
+
+    import torch
+
+    if "lib" not in _cublas:
+        torch.cuda.current_blas_handle()
+        with open("/proc/self/maps") as maps:
+            _cublas["lib"] = ctypes.CDLL(next(line.split()[-1] for line in maps if "/libcublas.so" in line))
+    lib = _cublas["lib"]
+    handle = ctypes.c_void_p(torch.cuda.current_blas_handle())
+    rc = lib.cublasSetSmCountTarget(handle, ctypes.c_int(count))
+    got = ctypes.c_int(-1)
+    lib.cublasGetSmCountTarget(handle, ctypes.byref(got))
+    thread = threading.get_ident()
+    logger.warning("cuBLAS SM target: pid %s %s thread %s rc=%s target=%s", os.getpid(), where, thread, rc, got.value)
+
+
+def _install_cublas_sm_target(gpu_worker, count: int) -> None:
+    import threading
+
+    _set_cublas_sm_target(count, "activate")
+    done = set()
+    run = gpu_worker.Worker.execute_model
+
+    def execute_model(self, *args, **kwargs):
+        tid = threading.get_ident()
+        if tid not in done:
+            done.add(tid)
+            _set_cublas_sm_target(count, "execute_model")
+        return run(self, *args, **kwargs)
+
+    gpu_worker.Worker.execute_model = execute_model
+
+
 def install_vllm_green_hook() -> None:
     """In a vLLM GPU worker, activate green streams once its distributed environment is up."""
     request = requested_green_sms()
@@ -124,7 +167,10 @@ def install_vllm_green_hook() -> None:
 
     def init_then_green(*args, **kwargs):
         result = original(*args, **kwargs)
-        activate_green_streams(*request)
+        sms = activate_green_streams(*request)
+        target = os.environ.get("FOPD_CUBLAS_SM_TARGET", "")
+        if target:
+            _install_cublas_sm_target(gpu_worker, sms if target == "green" else int(target))
         return result
 
     gpu_worker.init_worker_distributed_environment = init_then_green
