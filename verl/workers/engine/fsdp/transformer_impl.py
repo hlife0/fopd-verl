@@ -1211,6 +1211,12 @@ class EngineTrainModeCtx(BaseEngineCtx):
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
         super().__exit__(exc_type, exc_value, traceback)
+        if self.retain_params_on_exit and not self.disable_auto_offload:
+            # The model offload normally frees cached training allocations.
+            # Keep only its shards while returning optimizer/activation memory
+            # before the colocated rollout restores its weights.
+            get_torch_device().synchronize()
+            get_torch_device().empty_cache()
 
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])

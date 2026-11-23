@@ -259,6 +259,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         maybe_fix_3d_position_ids(data)
         batch_size_per_dp = data.shape[0]
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
+        retain_params = tu.pop(data, key="retain_params_for_publication", default=False)
         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
         num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
         epochs = tu.pop(data, key="epochs", default=1)
@@ -286,7 +287,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload, retain_params_on_exit=retain_params),
             Timer(name="train_batch", logger=None),
         ):
             # update

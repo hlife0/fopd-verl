@@ -882,10 +882,18 @@ class PPOTrainer(ABC):
         self.teacher_shared_actor_no_wait_sleep = bool(
             OmegaConf.select(config, "trainer.v1.sync.teacher_shared_actor_no_wait_sleep", default=False)
         )
+        self.teacher_shared_actor_optimize = bool(
+            OmegaConf.select(config, "trainer.v1.sync.teacher_shared_actor_optimize", default=False)
+        )
+        if self.teacher_shared_actor_optimize and not self.teacher_shared_actor:
+            raise ValueError("teacher_shared_actor_optimize requires teacher_shared_actor=True")
         if self.teacher_shared_actor_no_wait_sleep and not self.teacher_shared_actor:
             raise ValueError("teacher_shared_actor_no_wait_sleep requires teacher_shared_actor=True")
         if self.teacher_shared_actor:
             self._validate_teacher_shared_actor()
+            if self.teacher_shared_actor_optimize:
+                with open_dict(config.actor_rollout_ref.rollout):
+                    config.actor_rollout_ref.rollout.colocated_full_weight_sync = True
         # role => worker class
         self.role_worker_mapping = {}
         # role => resource pool
@@ -1994,6 +2002,7 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
             "opd_no_task_reward_fast_path": self.opd_no_task_reward_fast_path,
+            "retain_params_for_publication": getattr(self, "teacher_shared_actor_optimize", False),
         }
 
     def _apply_actor_update_metrics(self, output: TensorDict, metrics: dict) -> None:

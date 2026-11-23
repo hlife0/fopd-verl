@@ -252,6 +252,10 @@ trainer:
       # for Student or Teacher vLLM sleep. No memory check, retry, or OOM fallback.
       teacher_shared_actor_no_wait_sleep: false
 
+      # Retain Actor parameters until publication, discard replaced Student weights,
+      # recover Student/Teacher in parallel, and match early Actor's 50ms polling.
+      teacher_shared_actor_optimize: false
+
       # Accumulate complete, scored trajectories during Student rollout using
       # a limited Green compute stream; switch to full SMs after Student sleep.
       # Independent of early_actor_lite; requires the OPD fast path and MPS.

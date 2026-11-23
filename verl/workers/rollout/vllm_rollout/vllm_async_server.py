@@ -914,7 +914,11 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.HYBRID:
             await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            await self.engine.sleep(level=1)
+            if getattr(self.config, "colocated_full_weight_sync", False):
+                # Follow the same drafter/adapter protections as HYBRID sleep.
+                await self._sleep_hybrid()
+            else:
+                await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 

@@ -923,6 +923,7 @@ trainer:
       early_actor_lite: false
       teacher_shared_actor: false
       teacher_shared_actor_no_wait_sleep: false
+      teacher_shared_actor_optimize: false
       overlap_actor: false
       overlap_actor_sm_fraction: 0.5
     colocate_async:

@@ -96,6 +96,19 @@ def test_update_loop_names_each_mini_batch(monkeypatch):
     assert worker.profiler.step.call_count == len(mini_batches)
 
 
+def test_publication_retention_preserves_training_entry_and_mini_batch_count(monkeypatch):
+    mini_batches = [TensorDict({}, batch_size=[]) for _ in range(2)]
+    monkeypatch.setattr(tu, "make_iterator", lambda data, **kwargs: iter(mini_batches))
+    mode = MagicMock(return_value=nullcontext())
+    worker = _worker(_engine(train_mode=mode))
+    worker.train_batch = MagicMock(return_value={})
+    data = TensorDict({}, batch_size=[2])
+    tu.assign_non_tensor(data, num_mini_batch=2, retain_params_for_publication=True)
+    TrainingWorker.train_mini_batch(worker, data)
+    mode.assert_called_once_with(disable_auto_offload=False, retain_params_on_exit=True)
+    assert worker.train_batch.call_count == 2
+
+
 def test_forward_only_stage_is_not_a_profiler_step():
     data = TensorDict({}, batch_size=[])
     tu.assign_non_tensor(data, global_token_num=[4])

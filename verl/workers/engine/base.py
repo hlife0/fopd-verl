@@ -310,8 +310,9 @@ class BaseEngineCtx:
         assert self.mode in ("train", "eval")
         self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
         self.zero_grad_on_exit = kwargs.pop("zero_grad_on_exit", True)
+        self.retain_params_on_exit = kwargs.pop("retain_params_on_exit", False)
 
-    def _context_switch(self, device):
+    def _context_switch(self, device, retain_params=False):
         if self.disable_auto_offload:
             return
         if device != "cpu":
@@ -322,9 +323,9 @@ class BaseEngineCtx:
         elif self.mode == "train":
             self.engine.to(
                 device=device,
-                model=self.engine.is_param_offload_enabled,
+                model=self.engine.is_param_offload_enabled and not retain_params,
                 optimizer=self.engine.is_optimizer_offload_enabled,
-                grad=self.engine.is_param_offload_enabled,
+                grad=self.engine.is_param_offload_enabled and not retain_params,
             )
 
     def __enter__(self):
@@ -332,7 +333,9 @@ class BaseEngineCtx:
         self._context_switch(get_device_name())
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._context_switch("cpu")
+        # Publication can consume the updated GPU shards directly. Optimizer
+        # states still offload; failures restore the usual CPU placement.
+        self._context_switch("cpu", retain_params=self.retain_params_on_exit and exc_type is None)
         self.engine.mode = None
 
 
