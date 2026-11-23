@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CPU regressions for follow waiting and progress notifications."""
 
 import asyncio
@@ -10,6 +24,7 @@ from verl.experimental.teacher_loop.teacher_manager import _wait_for_follow_prog
 
 def test_already_submittable_progress_does_not_wait():
     """A previously delivered notification must not be needed after progress is visible."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt(list(range(17)))
@@ -20,6 +35,7 @@ def test_already_submittable_progress_does_not_wait():
 
 def test_stale_notification_waits_for_new_progress():
     """Clear the prompt notification and remain waiting until another update arrives."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt([1])
@@ -40,6 +56,7 @@ def test_stale_notification_waits_for_new_progress():
 @pytest.mark.parametrize("already_done", [False, True])
 def test_eos_releases_wait_for_short_tail(already_done):
     """Completion releases a short tail, even if completion preceded the wait."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt([1])
@@ -63,6 +80,7 @@ def test_eos_releases_wait_for_short_tail(already_done):
 
 def test_eos_without_new_tokens_does_not_wait():
     """A completed sequence with no remaining submission must terminate its loop."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt([1, 2, 3])
@@ -75,6 +93,7 @@ def test_eos_without_new_tokens_does_not_wait():
 
 def test_small_update_wakes_but_does_not_force_submission():
     """The session must recheck eligibility after a notification below the block threshold."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt([1])
@@ -101,6 +120,7 @@ def test_small_update_wakes_but_does_not_force_submission():
 
 def test_progress_arriving_at_clear_is_rechecked():
     """Progress visible immediately after clearing the notification is not lost."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt([1])
@@ -119,6 +139,7 @@ def test_progress_arriving_at_clear_is_rechecked():
 
 def test_cancelled_wait_does_not_consume_future_progress():
     """Cancelling one wait must leave later progress observable by another wait."""
+
     async def run():
         state = StudentTokenState()
         state.set_prompt([1])
