@@ -21,6 +21,7 @@ import os
 import time
 from typing import Any
 
+import hydra
 import ray
 import torch
 import transfer_queue as tq
@@ -32,6 +33,7 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.agent_loop.agent_loop import DictConfigWrap, ToolListWrap, _agent_loop_registry
 from verl.experimental.teacher_loop.teacher_follow import (
     TEACHER_FOLLOW_TRACE_KEYS,
     StudentTokenState,
@@ -68,6 +70,69 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         if state is not None:
             state.update_response(token_ids)
 
+    @staticmethod
+    def _prompt_from_batch(batch: TensorDict, index: int) -> dict:
+        prompt = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                prompt[key] = value[index]
+            elif isinstance(value, NonTensorStack):
+                prompt[key] = value[index].data
+            elif isinstance(value, NonTensorData):
+                prompt[key] = value.data
+            else:
+                logger.exception(f"Unsupported type {type(value)} for key {key}")
+        return prompt
+
+    async def _prime_teacher_prompt(self, prompt: dict, batch_id: str) -> tuple[bool, int]:
+        agent_name = prompt.get("agent_name", self.config.actor_rollout_ref.rollout.agent.default_agent_loop)
+        if not self._teacher_follow_enabled({"validate": prompt.get("validate", False)}, agent_name):
+            raise ValueError("Teacher prompt lookahead requires training with single-turn Teacher follow")
+        agent_loop = hydra.utils.instantiate(
+            config=_agent_loop_registry[agent_name],
+            trainer_config=DictConfigWrap(config=self.config),
+            server_manager=self.llm_client,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            hf_model_type=self.hf_model_type,
+            dataset_cls=self.dataset_cls,
+            data_config=DictConfigWrap(self.config.data),
+            tools=ToolListWrap(self.tools),
+        )
+        messages = list(prompt["raw_prompt"])
+        multi_modal_data = await agent_loop.process_multi_modal_info(messages)
+        if multi_modal_data:
+            raise ValueError("Teacher prompt lookahead supports text-only prompts")
+        # Keep the same CT construction and prompt truncation as SingleTurnAgentLoop.run.
+        agent_loop._assert_mm_supported(False)
+        prompt_ids = await agent_loop.ct_build_initial_tokens(messages, images=None, videos=None, audios=None)
+        primed = await self.teacher_server_manager.prime_prompt_lookahead(
+            prompt_ids,
+            batch_id=batch_id,
+            request_id=f"teacher-lookahead-{batch_id}-{prompt['uid']}",
+            routing_key=self._teacher_routing_key(prompt),
+        )
+        return primed, len(prompt_ids)
+
+    async def prime_teacher_prompts(self, batch: TensorDict, batch_id: str) -> dict[str, int | float]:
+        """Prefill this worker's next prompt chunk without starting Student generation."""
+        started = time.perf_counter()
+        self.teacher_server_manager.begin_prompt_lookahead(batch_id)
+        results = await asyncio.gather(
+            *(self._prime_teacher_prompt(self._prompt_from_batch(batch, i), batch_id) for i in range(len(batch))),
+            return_exceptions=True,
+        )
+        # Settle every request before returning a failure to the trainer's publication task.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return {
+            "prompts": len(results),
+            "primed_prompts": sum(int(primed) for primed, _ in results),
+            "prompt_tokens": sum(tokens for _, tokens in results),
+            "elapsed_s": time.perf_counter() - started,
+        }
+
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
         validate = batch["validate"] if "validate" in batch else False
@@ -98,16 +163,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         for i in range(len(batch)):
             # TODO(wuxibin): add trace support
             trace_this_sample = False
-            prompt = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    prompt[k] = v[i]
-                elif isinstance(v, NonTensorStack):
-                    prompt[k] = v[i].data
-                elif isinstance(v, NonTensorData):
-                    prompt[k] = v.data
-                else:
-                    logger.exception(f"Unsupported type {type(v)} for key {k}")
+            prompt = self._prompt_from_batch(batch, i)
 
             # “fire-and-forget” background tasks
             task = asyncio.create_task(
@@ -193,11 +249,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self._student_token_states[key] = state
         agent_loop.student_token_state = state
         agent_loop.student_token_notify_key = key
+        follow_kwargs = {}
+        if "teacher_lookahead_batch_id" in kwargs:
+            follow_kwargs["lookahead_batch_id"] = kwargs["teacher_lookahead_batch_id"]
         follow_task = asyncio.create_task(
             self.teacher_server_manager.compute_teacher_logprobs_follow(
                 state,
                 request_id=f"teacher-{key}",
                 routing_key=self._teacher_routing_key(kwargs),
+                **follow_kwargs,
             )
         )
         try:
@@ -378,6 +438,32 @@ class AgentLoopManagerTQ(AgentLoopManager):
         instance = cls(*args, **kwargs)
         await instance._init_agent_loop_workers()
         return instance
+
+    def prime_teacher_prompts(self, prompts: TensorDict, batch_id: str) -> dict[str, int | float]:
+        """Wait for Teacher prompt prefill using the same worker split as generation."""
+        started = time.perf_counter()
+        chunks = prompts.chunk(len(self.agent_loop_workers))
+        refs = [
+            worker.prime_teacher_prompts.remote(chunk, batch_id)
+            for worker, chunk in zip(self.agent_loop_workers, chunks, strict=False)
+        ]
+        # ray.get(list) can raise before sibling workers finish their GPU requests.
+        results, error = [], None
+        for ref in refs:
+            try:
+                results.append(ray.get(ref))
+            except Exception as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+        return {
+            "prompts": sum(result["prompts"] for result in results),
+            "primed_prompts": sum(result["primed_prompts"] for result in results),
+            "prompt_tokens": sum(result["prompt_tokens"] for result in results),
+            "worker_elapsed_s": sum(result["elapsed_s"] for result in results),
+            "elapsed_s": time.perf_counter() - started,
+        }
 
     def generate_sequences(self, prompts: TensorDict) -> None:
         """

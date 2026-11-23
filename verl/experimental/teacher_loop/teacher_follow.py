@@ -48,6 +48,7 @@ TEACHER_FOLLOW_TRACE_KEYS = (
     "teacher_last_cached_tokens",
     "teacher_last_prefill_s",
     "teacher_first_prefill_s",
+    "teacher_prompt_lookahead_tokens",
 )
 
 # Engine timings already produced by the vLLM server under student_* names.

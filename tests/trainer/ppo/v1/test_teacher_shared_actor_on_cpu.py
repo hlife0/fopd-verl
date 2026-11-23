@@ -64,6 +64,7 @@ def make_trainer(config):
     trainer.use_critic = trainer.use_reference_policy = False
     trainer.teacher_shared_actor = True
     trainer.teacher_shared_actor_no_wait_sleep = config.trainer.v1.sync.teacher_shared_actor_no_wait_sleep
+    trainer.teacher_shared_actor_optimize = config.trainer.v1.sync.teacher_shared_actor_optimize
     trainer.early_actor_lite = trainer.overlap_actor = False
     trainer.curr_step_profile = False
     trainer.global_steps = 1
@@ -112,6 +113,109 @@ def test_no_wait_sleep_config_enabled(config):
     trainer._init_resource_pool_mgr()
     assert trainer.teacher_shared_actor_no_wait_sleep
     assert trainer.resource_pool_manager.resource_pool_spec == {"global_pool": [3]}
+
+
+def test_optimization_requires_shared_actor(config):
+    config.trainer.v1.sync.teacher_shared_actor = False
+    config.trainer.v1.sync.teacher_shared_actor_optimize = True
+    with pytest.raises(ValueError, match="teacher_shared_actor_optimize requires"):
+        make_trainer(config)._init_resource_pool_mgr()
+
+
+def test_optimization_discards_only_student_old_weights(config):
+    config.trainer.v1.sync.teacher_shared_actor_optimize = True
+    make_trainer(config)._init_resource_pool_mgr()
+    assert config.actor_rollout_ref.rollout.colocated_full_weight_sync
+    teacher = config.distillation.teacher_models.teacher_model.inference
+    assert not teacher.get("colocated_full_weight_sync", False)
+
+
+def test_step_end_exposes_publication_metrics_once(config):
+    trainer = make_trainer(config)
+    trainer._publish_actor_weights = lambda: {"weight_publication/export_s": 0.5}
+    trainer.on_step_end()
+    assert trainer._consume_sync_metrics() == {"weight_publication/export_s": 0.5}
+    assert trainer._consume_sync_metrics() == {}
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_optimized_sampling_keeps_full_batch_path_with_shorter_poll(config, monkeypatch, fail):
+    from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+
+    config.trainer.v1.sync.teacher_shared_actor_optimize = True
+    trainer = make_trainer(config)
+    trainer.replay_buffer = SimpleNamespace(poll_interval=2.0)
+    batch = object()
+
+    def step(actual, metrics, timing, size):
+        assert actual is trainer and size == 96
+        assert trainer.replay_buffer.poll_interval == 0.05
+        if fail:
+            raise RuntimeError("sample failed")
+        return batch
+
+    monkeypatch.setattr(PPOTrainer, "_step_once", step)
+    if fail:
+        with pytest.raises(RuntimeError, match="sample failed"):
+            trainer._step_once({}, {}, 96)
+    else:
+        assert trainer._step_once({}, {}, 96) is batch
+    assert trainer.replay_buffer.poll_interval == 2.0
+
+
+@pytest.mark.parametrize("full_sync", [False, True])
+@pytest.mark.parametrize("protected_weights", [False, True])
+def test_colocated_student_sleep_preserves_teacher_and_drafter_weights(full_sync, protected_weights):
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+    server = SimpleNamespace(
+        node_rank=0,
+        rollout_mode=RolloutMode.COLOCATED,
+        config=SimpleNamespace(free_cache_engine=True, colocated_full_weight_sync=full_sync),
+        engine=SimpleNamespace(sleep=AsyncMock(), reset_encoder_cache=AsyncMock()),
+        _resolve_sleep_level=lambda: 1 if protected_weights else 2,
+    )
+    server._sleep_hybrid = lambda: vLLMHttpServer._sleep_hybrid(server)
+    asyncio.run(vLLMHttpServer.sleep(server))
+    server.engine.sleep.assert_awaited_once_with(level=2 if full_sync and not protected_weights else 1)
+
+
+@pytest.mark.parametrize("failed_side", [None, "student", "teacher", "offload"])
+def test_optimized_recovery_joins_both_sides_after_actor_offload(config, failed_side):
+    config.trainer.v1.sync.teacher_shared_actor_optimize = True
+    trainer = make_trainer(config)
+    published, offloaded = Event(), Event()
+    started = {name: Event() for name in ("student", "teacher")}
+    finished = {name: Event() for name in started}
+
+    def wake(name):
+        assert published.is_set() and offloaded.is_set()
+        started[name].set()
+        other = "teacher" if name == "student" else "student"
+        assert started[other].wait(5), "recovery was serialized"
+        finished[name].set()
+        if name == failed_side:
+            raise RuntimeError("recovery failed")
+
+    def offload(device):
+        assert device == "cpu" and published.is_set()
+        assert not any(e.is_set() for e in started.values())
+        if failed_side == "offload":
+            raise RuntimeError("offload failed")
+        offloaded.set()
+
+    trainer.checkpoint_manager = SimpleNamespace(
+        wake_up_replicas=lambda tags: wake("student") if tags == ["kv_cache"] else None,
+        update_weights=lambda step: published.set(),
+    )
+    trainer.actor_rollout_wg = SimpleNamespace(to=offload)
+    trainer.teacher_model_manager = SimpleNamespace(wake_up=lambda: wake("teacher"))
+    if failed_side:
+        with pytest.raises(RuntimeError, match="failed"):
+            trainer._publish_actor_weights()
+    else:
+        trainer._publish_actor_weights()
+    assert all(event.is_set() == (failed_side != "offload") for event in finished.values())
 
 
 def test_multiple_batches_per_publication_rejected(config):
@@ -200,7 +304,8 @@ def test_no_wait_dispatches_actor_while_sleep_is_pending(config, blocked, oom):
     trainer._record_gen_split_timing = lambda *args: None
     trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=[])
     trainer._balance_batch = lambda batch, **kwargs: batch
-    trainer._actor_update_extra_info = lambda: {}
+    trainer._actor_dp_size = lambda: config.trainer.n_gpus_per_node + config.distillation.n_gpus_per_node
+    trainer._actor_update_extra_info = lambda: {"mini_batch_size": 48}
     trainer._apply_actor_update_metrics = lambda *args: None
     failure = torch.OutOfMemoryError("simulated Actor OOM")
 
@@ -307,9 +412,12 @@ def test_no_wait_sleep_failure_propagates_before_publication(config, failed_side
                 pass
 
 
+@pytest.mark.parametrize("initial", [False, True])
 @pytest.mark.parametrize("fail_publication", [False, True])
-def test_teacher_wakes_only_after_all_actor_ranks_finish_publication(config, fail_publication):
+def test_teacher_wakes_only_after_all_actor_ranks_finish_publication(config, fail_publication, initial):
     trainer = make_trainer(config)
+    if initial:
+        del trainer.timing_raw
     events = []
 
     def publish(step):
@@ -371,6 +479,7 @@ def test_colocated_vllm_wakes_only_requested_memory():
     server = SimpleNamespace(
         node_rank=0,
         rollout_mode=RolloutMode.COLOCATED,
+        config=SimpleNamespace(sleep_keep_weights=False),
         engine=SimpleNamespace(wake_up=AsyncMock(), reset_prefix_cache=AsyncMock()),
         _get_wake_up_tags=lambda: ["weights", "kv_cache"],
     )

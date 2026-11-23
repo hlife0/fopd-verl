@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from omegaconf import DictConfig
 from torch.nn import functional as F
 
 from verl.experimental.teacher_loop.teacher_follow import (
+    FOLLOW_KV_BLOCK_SIZE,
     FollowMidGate,
     StudentTokenState,
     TeacherFollowAccumulator,
@@ -169,6 +171,91 @@ class AsyncTeacherLLMServerManager:
             )
         self.teacher_client: dict[str, LLMServerClient] = teacher_client
         self.follow_mid_gate = _make_follow_mid_gate(self.distillation_config, config)
+        self._prompt_lookahead_full_determinism = bool(getattr(config.actor_rollout_ref.rollout, "full_determinism", False))
+        self._prompt_lookahead_batch_id: Optional[str] = None
+        self._prompt_lookahead_entries: dict[tuple[str, tuple[int, ...]], tuple[str, TeacherFollowAccumulator]] = {}
+
+    def begin_prompt_lookahead(self, batch_id: str) -> None:
+        """Replace the worker-local seeds with the next batch's prompt scores.
+
+        Call after the frozen Teacher wakes, and preserve its KV/sticky caches
+        until this batch scores. The caller primes the same prompt split that
+        this worker will generate, using the actual single-turn prompt tokens.
+        """
+        if self._prompt_lookahead_full_determinism:
+            raise ValueError("Teacher prompt lookahead does not support rollout.full_determinism")
+        self._prompt_lookahead_batch_id = batch_id
+        self._prompt_lookahead_entries = {}
+
+    async def prime_prompt_lookahead(
+        self,
+        prompt_ids: list[int],
+        *,
+        batch_id: str,
+        request_id: str,
+        routing_key: Optional[str] = None,
+    ) -> bool:
+        """Prefill one text prompt and retain the score rows hidden by later KV hits.
+
+        A prompt seed can serve multiple Student rollouts. Its request ID keeps
+        all those Teacher requests on the same replica through sticky routing.
+        No future Student response is generated or scored by this call.
+        """
+        if batch_id != self._prompt_lookahead_batch_id:
+            raise ValueError("begin_prompt_lookahead must select the batch before priming")
+        if not prompt_ids:
+            raise ValueError("Teacher prompt lookahead requires a nonempty prompt")
+        teacher_key = self._resolve_teacher_key(routing_key)
+        key = (teacher_key, tuple(prompt_ids))
+        entries = self._prompt_lookahead_entries
+        if key in entries:
+            return True
+        use_topk = self.distillation_loss_config.loss_settings.use_topk
+        prime_len = len(prompt_ids)
+        if not use_topk:
+            # Sampled-token losses need the actual Student token at the prompt
+            # boundary. Like mid-follow, stop at a whole KV block plus one known
+            # prompt token, so the next request recomputes that boundary row.
+            prime_len = follow_submit_len(len(prompt_ids), False, 0) or min(
+                len(prompt_ids), FOLLOW_KV_BLOCK_SIZE - 1
+            )
+        # Read all rows of this prefix even if another prompt warmed shared
+        # blocks. KV alone would trigger _fill_unscored_prefix to redo them.
+        extra = await self._teacher_forward(
+            list(prompt_ids[:prime_len]),
+            request_id=request_id,
+            follow=False,
+            need_decode_topk=use_topk,
+            routing_key=routing_key,
+        )
+        ids, lps, decode_ids, decode_lps, _ = unpack_teacher_extract(extra)
+        if use_topk and (decode_ids is None or decode_lps is None):
+            raise RuntimeError("Teacher prompt lookahead requires the prompt boundary top-k")
+        if not use_topk:
+            # A Teacher-sampled token is not the future Student token.
+            decode_ids, decode_lps = None, None
+        acc = TeacherFollowAccumulator(_teacher_topk_width(self.distillation_loss_config))
+        acc.apply(prime_len, 0, ids, lps, decode_ids, decode_lps)
+        if entries is not self._prompt_lookahead_entries:
+            return False
+        entries[key] = (request_id, acc)
+        return True
+
+    def _prompt_lookahead_seed(
+        self,
+        state: StudentTokenState,
+        batch_id: Optional[str],
+        routing_key: Optional[str],
+    ) -> Optional[tuple[str, TeacherFollowAccumulator]]:
+        if batch_id is None or batch_id != getattr(self, "_prompt_lookahead_batch_id", None):
+            return None
+        # This experiment primes text-only prompts. Token identity alone cannot
+        # establish that image/audio inputs or processor settings are the same.
+        if state.multi_modal_data or state.mm_processor_kwargs:
+            return None
+        key = (self._resolve_teacher_key(routing_key), tuple(state.prompt_ids))
+        seed = self._prompt_lookahead_entries.get(key)
+        return None if seed is None else copy.deepcopy(seed)
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
@@ -356,6 +443,8 @@ class AsyncTeacherLLMServerManager:
         state: StudentTokenState,
         request_id: str,
         routing_key: Optional[str] = None,
+        *,
+        lookahead_batch_id: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Follow one Student sequence: at most one in-flight Teacher request
         (two while a final request overtakes a mid hop).
@@ -366,7 +455,13 @@ class AsyncTeacherLLMServerManager:
         is the suffix.
         """
         await state.ready.wait()
-        acc = TeacherFollowAccumulator(_teacher_topk_width(self.distillation_loss_config))
+        teacher_request_id = request_id
+        seed = self._prompt_lookahead_seed(state, lookahead_batch_id, routing_key)
+        if seed is None:
+            acc = TeacherFollowAccumulator(_teacher_topk_width(self.distillation_loss_config))
+        else:
+            teacher_request_id, acc = seed
+        lookahead_tokens = acc.scored_seq_len
         extra_out: dict[str, Any] = {}
         teacher_start_ts = None
         num_requests = 0
@@ -437,7 +532,7 @@ class AsyncTeacherLLMServerManager:
                 gate_wait_since = None
                 payload = seq[:submit_len]
                 hop = asyncio.ensure_future(
-                    self._follow_forward(payload, request_id, routing_key, state, priority, gate_cost)
+                    self._follow_forward(payload, teacher_request_id, routing_key, state, priority, gate_cost)
                 )
                 final_seq = None
                 done_wait = None
@@ -452,7 +547,7 @@ class AsyncTeacherLLMServerManager:
                         final_priority = follow_request_priority(True, prioritize_done)
                         final_submit_ts = time.time()
                         final_extra = await self._follow_forward(
-                            final_seq, request_id, routing_key, state, final_priority
+                            final_seq, teacher_request_id, routing_key, state, final_priority
                         )
                         if int(final_extra.get("num_cached_tokens") or 0) <= acc.scored_seq_len:
                             # Its rows start at or before what is stitched: it covers the hop.
@@ -467,7 +562,7 @@ class AsyncTeacherLLMServerManager:
                 extra_calls = 0
                 if extra is not None:
                     extra_calls = await self._apply_follow_extract(
-                        acc, payload, extra, request_id, routing_key, state, priority
+                        acc, payload, extra, teacher_request_id, routing_key, state, priority
                     )
                 _record(len(seq), submit_len, scored_before, extra, submit_ts, priority, gate_wait_s, extra_calls)
                 if final_seq is not None:
@@ -475,7 +570,7 @@ class AsyncTeacherLLMServerManager:
                     # the final request read the blocks it computed.
                     scored_before = acc.scored_seq_len
                     extra_calls = await self._apply_follow_extract(
-                        acc, final_seq, final_extra, request_id, routing_key, state, final_priority
+                        acc, final_seq, final_extra, teacher_request_id, routing_key, state, final_priority
                     )
                     _record(
                         len(final_seq),
@@ -493,6 +588,8 @@ class AsyncTeacherLLMServerManager:
                 await state.wait_until_submittable(acc.scored_seq_len)
 
         teacher_ids, teacher_logprobs = acc.finalize()
+        if lookahead_batch_id is not None:
+            extra_out["teacher_prompt_lookahead_tokens"] = lookahead_tokens
         extra_out["teacher_start_ts"] = teacher_start_ts
         extra_out["teacher_done_ts"] = time.time()
         extra_out["teacher_num_requests"] = num_requests
