@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -201,3 +203,100 @@ def test_disabled_early_actor_lite_uses_base_step(monkeypatch):
     monkeypatch.setattr("verl.trainer.ppo.v1.trainer_base.PPOTrainer._step_once", fake_base)
     assert trainer._step_once({}, {}, sample_batch_size=8) == "base"
     assert called["sample_batch_size"] == 8
+
+
+@pytest.mark.parametrize("failure", [None, "sleep", "fb"])
+def test_early_actor_plus_starts_after_students_and_joins_sleep_before_update(failure):
+    trainer = _lite_trainer()
+    trainer.early_actor_plus = True
+    trainer.early_actor_stream_fb = True
+    trainer.opd_no_task_reward_fast_path = True
+    students_done, sleep_started, fb_started, sleep_done = [threading.Event() for _ in range(4)]
+    order = []
+    batch = SimpleNamespace(
+        keys=["a", "b"],
+        tags=[{"response_len": 2, "teacher_done_ts": 1.0} for _ in range(2)],
+        extra_info={},
+        partition_id="train",
+    )
+
+    def wait_students(**kwargs):
+        assert not sleep_started.is_set() and not fb_started.is_set()
+        students_done.set()
+
+    def sleep():
+        assert students_done.is_set()
+        sleep_started.set()
+        try:
+            # A serial sleep-then-F/B implementation cannot satisfy this wait.
+            assert fb_started.wait(3), "F/B did not start while sleep was pending"
+            if failure == "sleep":
+                raise RuntimeError("sleep failed")
+        finally:
+            order.append("sleep_done")
+            sleep_done.set()
+
+    class Workers:
+        def begin_actor_accumulate(self):
+            assert students_done.is_set()
+
+        def accumulate_actor(self, chunk):
+            assert sleep_started.wait(3)
+            assert students_done.is_set() and not sleep_done.is_set()
+            start = time.time()
+            fb_started.set()
+            assert sleep_done.wait(3)
+            if failure == "fb":
+                raise RuntimeError("fb failed")
+            return {"metrics": {"chunk_fb_s": 0.001,
+                                "chunk_fb_start_ts": [start], "chunk_fb_end_ts": [time.time()]}}
+
+        def finish_actor_accumulate(self):
+            assert sleep_done.is_set()
+            order.append("finish")
+            return {"metrics": {}}
+
+        def abort_actor_accumulate(self):
+            order.append("abort")
+
+    trainer.replay_buffer = SimpleNamespace(
+        poll_interval=2.0,
+        wait_until_students_done=wait_students,
+        peek_student_ready=lambda **kwargs: batch,
+        peek_teacher_ready_keys=lambda *args: batch.keys,
+        peek_trajectories=lambda *args: batch,
+        sample=lambda **kwargs: (batch, {}),
+    )
+    trainer.actor_rollout_wg = Workers()
+    trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=object())
+    trainer.on_sample_begin = lambda: None
+    trainer.on_sample_end = sleep
+    trainer._actor_dp_size = lambda: 2
+    trainer._actor_update_extra_info = lambda: {}
+    trainer._balance_batch = lambda batch, **kwargs: batch
+    trainer._apply_actor_update_metrics = lambda *args: None
+    trainer._record_gen_split_timing = lambda *args: None
+    trainer._dump_actor_timeline = lambda *args: None
+    metrics = {}
+    if failure:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            trainer._step_once(metrics, {}, 2)
+        assert "finish" not in order and "abort" in order
+    else:
+        assert trainer._step_once(metrics, {}, 2) is batch
+        assert order.index("sleep_done") < order.index("finish")
+        assert metrics["early_actor_plus/fb_sleep_overlap_s"] > 0
+    assert sleep_done.is_set()
+    assert trainer.replay_buffer.poll_interval == 2.0
+
+
+def test_early_actor_plus_selects_streaming_path_and_rejects_missing_fast_path():
+    trainer = _lite_trainer()
+    trainer.config.trainer.v1.sync = {"early_actor_plus": True}
+    trainer.config.data = {"train_batch_size": 2}
+    trainer.config.actor_rollout_ref.actor = {"ppo_epochs": 1, "ppo_mini_batch_size": 2, "strategy": "fsdp"}
+    with pytest.raises(ValueError, match="early_actor_plus requires"):
+        trainer._configure_early_actor_lite()
+    trainer.opd_no_task_reward_fast_path = True
+    trainer._configure_early_actor_lite()
+    assert trainer.early_actor_lite and trainer.early_actor_stream_fb and trainer.early_actor_plus

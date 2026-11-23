@@ -14,7 +14,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Generator
+from typing import Any, AsyncGenerator, Callable, Generator
 
 import ray
 import torch
@@ -503,7 +503,7 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, after_actor_export: Callable[[], None] | None = None):
         """Update weights from actor worker group to rollout replicas.
 
         Args:
@@ -532,10 +532,17 @@ class CheckpointEngineManager:
         self.build_process_group(rollout)
 
         # 5. update weights of all workers
-        results = ray.get(
-            actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-            + rollout.update_weights(global_steps=global_steps)
-        )
+        actor_updates = actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
+        rollout_updates = rollout.update_weights(global_steps=global_steps)
+        if after_actor_export is None:
+            results = ray.get(actor_updates + rollout_updates)
+        else:
+            # Start both sides before waiting: senders require live receivers.
+            # Once every Actor RPC returns, all FSDP export tensors and sends
+            # are finished; receiver-side loading/finalization may still run.
+            actor_results = ray.get(actor_updates)
+            after_actor_export()
+            results = actor_results + ray.get(rollout_updates)
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.
         sync_metrics: dict = {}

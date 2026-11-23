@@ -160,6 +160,13 @@ class vLLMHttpServer:
             os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
         self.rollout_mode = rollout_mode
+        if self.config.sleep_keep_weights and (
+            rollout_mode != RolloutMode.COLOCATED
+            or self.config.data_parallel_size != 1
+            or nnodes != 1
+            or self.config.colocated_full_weight_sync
+        ):
+            raise ValueError("sleep_keep_weights requires single-node colocated vLLM, DP=1, and frozen weights")
         self.workers = workers
 
         self.replica_rank = replica_rank
@@ -890,6 +897,12 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
 
+        if getattr(self.config, "sleep_keep_weights", False):
+            if tags is None or "kv_cache" in tags:
+                await self.engine.collective_rpc("wake_kv_cache_only")
+                await self.engine.reset_prefix_cache(reset_connector=True)
+            return
+
         if self.rollout_mode == RolloutMode.HYBRID:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
             # processes across all DP shards (unlike collective_rpc which only reaches
@@ -911,10 +924,21 @@ class vLLMHttpServer:
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
+        if getattr(self.config, "sleep_keep_weights", False):
+            # The replica drains all requests before reaching this method.
+            # Drop cached block references before their physical memory is freed.
+            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self.engine.collective_rpc("sleep_kv_cache_only")
+            return
+
         if self.rollout_mode == RolloutMode.HYBRID:
             await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            await self.engine.sleep(level=1)
+            if getattr(self.config, "colocated_full_weight_sync", False):
+                # Follow the same drafter/adapter protections as HYBRID sleep.
+                await self._sleep_hybrid()
+            else:
+                await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 

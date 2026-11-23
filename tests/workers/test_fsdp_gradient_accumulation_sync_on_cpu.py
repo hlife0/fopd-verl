@@ -14,6 +14,7 @@
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -26,6 +27,33 @@ from torch.distributed.fsdp import ShardingStrategy, fully_shard
 
 from verl.workers.engine.fsdp import transformer_impl
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
+
+
+@pytest.mark.parametrize("retain", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_train_context_retains_only_parameters_for_successful_publication(monkeypatch, retain, failed):
+    engine = object.__new__(FSDPEngine)
+    engine._is_offload_param = engine._is_offload_optimizer = True
+    engine.module = SimpleNamespace(train=Mock())
+    engine.ulysses_parallel_group = None
+    engine.to = Mock()
+    engine.optimizer_zero_grad = Mock()
+    device = Mock()
+    monkeypatch.setattr(transformer_impl, "get_torch_device", lambda: device)
+    monkeypatch.setattr(transformer_impl, "get_ulysses_sequence_parallel_group", lambda: None)
+    monkeypatch.setattr(transformer_impl, "set_ulysses_sequence_parallel_group", lambda group: None)
+    from verl.workers.engine import base
+
+    monkeypatch.setattr(base, "get_device_name", lambda: "cuda")
+    ctx = transformer_impl.EngineTrainModeCtx(engine, retain_params_on_exit=retain)
+    ctx.__enter__()
+    engine.to.assert_called_once_with(device="cuda", model=True, optimizer=True, grad=True)
+    ctx.__exit__(RuntimeError if failed else None, None, None)
+    engine.optimizer_zero_grad.assert_called_once()
+    keep = retain and not failed
+    engine.to.assert_called_with(device="cpu", model=not keep, optimizer=True, grad=not keep)
+    assert engine.mode is None
+    assert device.empty_cache.call_count == int(retain)
 
 
 class _FSDP1Module:
