@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import asyncio
 import json
 import logging
@@ -186,6 +187,7 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
+    @opd_timeline.observed("teacher.hop", "teacher", coarse=False)
     async def _teacher_forward(
         self,
         sequence_ids: list[int],
@@ -225,6 +227,7 @@ class AsyncTeacherLLMServerManager:
             assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return extra
 
+    @opd_timeline.observed("teacher.score", "teacher", coarse=False)
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],
@@ -351,6 +354,7 @@ class AsyncTeacherLLMServerManager:
             if gate_cost:
                 self.follow_mid_gate.release(gate_cost)
 
+    @opd_timeline.observed("teacher.ready", "teacher", coarse=False)
     async def compute_teacher_logprobs_follow(
         self,
         state: StudentTokenState,
@@ -399,6 +403,7 @@ class AsyncTeacherLLMServerManager:
                 "hole_fills": int(extra_calls),
             }
             request_log.append(row)
+            opd_timeline.emit("teacher.score_applied", scored_after=acc.scored_seq_len, **row)
             _follow_cache_log = os.environ.get("FOPD_FOLLOW_CACHE_LOG")
             if _follow_cache_log:
                 with open(_follow_cache_log, "a", encoding="utf-8") as _fh:
