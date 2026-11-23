@@ -54,6 +54,20 @@ def _chunk_fb_s(output) -> float | None:
         return None
 
 
+def _chunk_fb_timestamps(output) -> dict:
+    """Keep the worker F/B interval instead of averaging timestamps across chunks."""
+    output = _first_output(output)
+    if output is None:
+        return {}
+    result = {}
+    for key, reduce in (("chunk_fb_start_ts", min), ("chunk_fb_end_ts", max)):
+        value = output["metrics"].get(key)
+        if value is not None:
+            values = value if isinstance(value, (list, tuple)) else [value]
+            result[key] = reduce(float(item) for item in values)
+    return result
+
+
 @register_trainer("sync")
 class PPOTrainerSync(PPOTrainer):
     """Synchronous PPO trainer
@@ -137,6 +151,8 @@ class PPOTrainerSync(PPOTrainer):
                 getattr(self, "teacher_shared_actor_no_wait_sleep", False)
             )
             metrics["teacher_shared_actor/optimize"] = int(getattr(self, "teacher_shared_actor_optimize", False))
+        if getattr(self, "early_actor_plus", False):
+            metrics["early_actor_plus/enabled"] = 1
         return batch
 
     def _configure_opd_no_task_reward_fast_path(self) -> None:
@@ -175,7 +191,8 @@ class PPOTrainerSync(PPOTrainer):
 
     def _configure_early_actor_lite(self) -> None:
         sync_config = self.config.trainer.v1.sync
-        self.early_actor_lite = bool(sync_config.get("early_actor_lite", False))
+        self.early_actor_plus = bool(sync_config.get("early_actor_plus", False))
+        self.early_actor_lite = bool(sync_config.get("early_actor_lite", False)) or self.early_actor_plus
         if not self.early_actor_lite:
             self.early_actor_stream_fb = False
             return
@@ -198,7 +215,13 @@ class PPOTrainerSync(PPOTrainer):
             and not getattr(self, "use_critic", False)
             and not getattr(self, "use_reference_policy", False)
         )
-        if self.early_actor_stream_fb:
+        if self.early_actor_plus:
+            if not self.early_actor_stream_fb:
+                raise ValueError("early_actor_plus requires the OPD fast path and full-batch streaming FSDP Actor")
+            logger.info(
+                "early_actor_plus: wait for all Students, then overlap Student vLLM sleep with full-SM Actor F/B"
+            )
+        elif self.early_actor_stream_fb:
             logger.info(
                 "early_actor_lite: sleep Student vLLM after the Student barrier, then stream "
                 "Actor F/B on teacher-ready samples while leftover Teacher scoring continues"
@@ -284,16 +307,21 @@ class PPOTrainerSync(PPOTrainer):
                     sessions_per_prompt=sessions_per_prompt,
                 )
                 student_batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                # Free Student vLLM on the colocated GPUs; Teacher pool keeps scoring.
-                self._trace_sleep_start_ts = time.time()
-                self.on_sample_end()
-                self._trace_sleep_end_ts = time.time()
+                if not getattr(self, "early_actor_plus", False):
+                    # Free Student vLLM on the colocated GPUs; Teacher pool keeps scoring.
+                    self._trace_sleep_start_ts = time.time()
+                    self.on_sample_end()
+                    self._trace_sleep_end_ts = time.time()
 
             if self.reward_loop_manager.reward_loop_worker_handles is None:
                 with marked_timer("reward", timing_raw, color="yellow"):
                     student_batch = self._compute_reward_colocate(student_batch, metrics=metrics)
 
             if getattr(self, "early_actor_stream_fb", False):
+                if getattr(self, "early_actor_plus", False):
+                    return self._stream_actor_during_student_sleep(
+                        student_batch, metrics, timing_raw, sample_batch_size
+                    )
                 return self._stream_actor_with_leftover_teacher(student_batch, metrics, timing_raw, sample_batch_size)
 
             student_batch = self._balance_batch(student_batch, metrics=metrics)
@@ -460,12 +488,32 @@ class PPOTrainerSync(PPOTrainer):
         self._dump_actor_timeline(batch)
         return batch
 
+    def _stream_actor_during_student_sleep(self, student_batch, metrics, timing_raw, sample_batch_size):
+        # This is reached only after the Student-complete barrier. The sleep RPC
+        # targets the separate vLLM processes, while FSDP keeps its resident model.
+        def sleep_students():
+            self._trace_sleep_start_ts = time.time()
+            self.on_sample_end()
+            self._trace_sleep_end_ts = time.time()
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="early-actor-plus-sleep") as executor:
+            sleep_future = executor.submit(sleep_students)
+            try:
+                return self._stream_actor_with_leftover_teacher(
+                    student_batch, metrics, timing_raw, sample_batch_size, sleep_future=sleep_future
+                )
+            finally:
+                # Join on failure too: no sleep may leak into the next step or
+                # race a weight publication. result() also propagates RPC errors.
+                sleep_future.result()
+
     def _stream_actor_with_leftover_teacher(
         self,
         student_batch: KVBatchMeta,
         metrics: dict,
         timing_raw: dict,
         sample_batch_size: int,
+        sleep_future=None,
     ) -> KVBatchMeta:
         traj_keys = [
             key
@@ -490,6 +538,8 @@ class PPOTrainerSync(PPOTrainer):
             self._trace_fsdp_load_end_ts = time.time()
             try:
                 while len(consumed) < len(traj_keys):
+                    if sleep_future is not None and sleep_future.done():
+                        sleep_future.result()
                     ready = [
                         key
                         for key in self.replay_buffer.peek_teacher_ready_keys(student_batch.partition_id, traj_keys)
@@ -530,9 +580,13 @@ class PPOTrainerSync(PPOTrainer):
                             "dispatch_ts": dispatch_ts,
                             "return_ts": return_ts,
                             "chunk_fb_s": _chunk_fb_s(output),
+                            **_chunk_fb_timestamps(output),
                         }
                     )
                     if is_last:
+                        if sleep_future is not None:
+                            # Do not commit the update if concurrent sleep failed.
+                            sleep_future.result()
                         finish_ts = time.time()
                         output = _first_output(self.actor_rollout_wg.finish_actor_accumulate())
                         self._trace_actor_finish_end_ts = time.time()
@@ -552,6 +606,18 @@ class PPOTrainerSync(PPOTrainer):
         metrics["early_actor_lite/chunks"] = len(chunk_sizes)
         if chunk_sizes:
             metrics["early_actor_lite/first_chunk"] = chunk_sizes[0]
+        if sleep_future is not None:
+            sleep_start, sleep_end = self._trace_sleep_start_ts, self._trace_sleep_end_ts
+            timing_raw["student_sleep"] = sleep_end - sleep_start
+            metrics["early_actor_plus/sleep_s"] = sleep_end - sleep_start
+            metrics["early_actor_plus/barrier_to_dispatch_s"] = (
+                chunk_events[0]["dispatch_ts"] - self._trace_student_barrier_ts
+            )
+            metrics["early_actor_plus/fb_sleep_overlap_s"] = sum(
+                max(0.0, min(event["chunk_fb_end_ts"], sleep_end) - max(event["chunk_fb_start_ts"], sleep_start))
+                for event in chunk_events
+                if "chunk_fb_start_ts" in event and "chunk_fb_end_ts" in event
+            )
 
         with marked_timer("gen", timing_raw, color="red"):
             batch, off_policy_metrics = self.replay_buffer.sample(
@@ -615,6 +681,8 @@ class PPOTrainerSync(PPOTrainer):
                     **event,
                     "dispatch_s": rel(event.get("dispatch_ts")),
                     "return_s": rel(event.get("return_ts")),
+                    "chunk_fb_start_s": rel(event.get("chunk_fb_start_ts")),
+                    "chunk_fb_end_s": rel(event.get("chunk_fb_end_ts")),
                 }
             )
         payload = {
