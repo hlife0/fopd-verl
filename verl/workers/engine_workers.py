@@ -1,3 +1,4 @@
+from verl.utils import opd_publication_host as _pub
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from verl.utils import opd_timeline
+from verl.utils import actor_quota_probe
 import functools
 import gc
 import logging
@@ -470,6 +472,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if self._held_loss_normalization_tokens is not None:
             tu.assign_non_tensor(data, batch_num_tokens_override=self._held_loss_normalization_tokens)
             chunk_loss_tokens = data["loss_mask"].sum().detach().to(self._held_loss_tokens)
+        actor_quota_probe.capture(self, data)
         global_token_num = self._global_token_num(data)
         chunk_fb_start_ts = time.time()
         with Timer(name="train_batch", logger=None) as timer:
@@ -508,7 +511,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def finish_held_train(self):
         if self._held_train_ctx is None:
             raise RuntimeError("held train is not open")
-        return self._close_held_train(step=True)
+        actor_quota_probe.replay(self)
+        result = self._close_held_train(step=True)
+        actor_quota_probe.updated(self)
+        return result
 
     def abort_held_train(self):
         if self._held_train_ctx is None:
@@ -968,88 +974,101 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+        with _pub.publication(global_steps, torch.distributed.get_rank(), effective_mode):
 
-        # 0. send_weights only for async training with disaggregated trainer and rollout
-        if effective_mode != "naive":
-            if effective_mode == "delta_sharded":
-                # the delta engine owns the sync state machine (seed vs steady,
-                # snapshot prime), so it drives the training engine itself.
-                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+            # 0. send_weights only for async training with disaggregated trainer and rollout
+            if effective_mode != "naive":
+                if effective_mode == "delta_sharded":
+                    # the delta engine owns the sync state machine (seed vs steady,
+                    # snapshot prime), so it drives the training engine itself.
+                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                    return metrics or {}
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
                 return metrics or {}
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
-            return metrics or {}
 
-        set_expandable_segments(False)
-        freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
-        publication_opt = bool(freeze_step)
-        if publication_opt and global_steps == int(freeze_step):
-            # Warm-up boundary: later cleanup scans only objects allocated after this.
-            gc.collect()
-            gc.freeze()
-            logger.warning("OPD publication GC frozen at global step %s", global_steps)
-        aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
-        log_gpu_memory_usage("Before resume weights", logger=logger)
+            set_expandable_segments(False)
+            freeze_step = os.getenv("OPD_PUBLICATION_GC_FREEZE_STEP", "")
+            publication_opt = bool(freeze_step)
+            if publication_opt and global_steps == int(freeze_step):
+                # Warm-up boundary: later cleanup scans only objects allocated after this.
+                gc.collect()
+                gc.freeze()
+                logger.warning("OPD publication GC frozen at global step %s", global_steps)
+            with _pub.span('cleanup'):
+                aggressive_empty_cache(force_sync=True, max_retries=1 if publication_opt else 3)
+            log_gpu_memory_usage("Before resume weights", logger=logger)
 
-        # 1. resume rollout memory (weights were released during sleep)
-        # sleep_level=1 (adapter mode) in SGLang never released weights, so do not resume them.
-        # vLLM is different: its level-1 sleep goes through CuMemAllocator.sleep(offload_tags=("weights",))
-        is_sglang = self.config.rollout.get("name", "") == "sglang"
-        if is_sglang:
-            resume_weights = self.config.rollout.free_cache_engine and getattr(self.rollout, "sleep_level", 2) != 1
-        else:
-            # vLLM: level-1 sleep still unmaps weights → must resume.
-            resume_weights = self.config.rollout.free_cache_engine
-        if resume_weights:
-            await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+            # 1. resume rollout memory (weights were released during sleep)
+            # sleep_level=1 (adapter mode) in SGLang never released weights, so do not resume them.
+            # vLLM is different: its level-1 sleep goes through CuMemAllocator.sleep(offload_tags=("weights",))
+            is_sglang = self.config.rollout.get("name", "") == "sglang"
+            if is_sglang:
+                resume_weights = self.config.rollout.free_cache_engine and getattr(self.rollout, "sleep_level", 2) != 1
+            else:
+                # vLLM: level-1 sleep still unmaps weights → must resume.
+                resume_weights = self.config.rollout.free_cache_engine
+            if resume_weights:
+                with _pub.span('resume_weights'):
+                    await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resume weights", logger=logger)
 
-        # 2. determine if we need a base weight sync (adapter path only)
-        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
-        )
+            # 2. determine if we need a base weight sync (adapter path only)
+            with _pub.span('export_setup'):
+                per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+                    layered_summon=self.layered_summon, base_sync_done=True
+                )
 
-        do_lora_base_sync = False
-        if not self.peft_merge and peft_config is not None:
-            self.rollout.sleep_level = 1
-            do_lora_base_sync = not self.base_sync_done
+            do_lora_base_sync = False
+            if not self.peft_merge and peft_config is not None:
+                self.rollout.sleep_level = 1
+                do_lora_base_sync = not self.base_sync_done
 
-        # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
-        if do_lora_base_sync:
-            per_tensor_param_base, _base_peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
-            )
-            await self.rollout.update_weights(
-                per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps
-            )
+            # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
+            if do_lora_base_sync:
+                with _pub.span('base_export_setup'):
+                    per_tensor_param_base, _base_peft_config = self.actor.engine.get_per_tensor_param(
+                        layered_summon=self.layered_summon, base_sync_done=False
+                    )
+                with _pub.span('consume_update_weights'):
+                    await self.rollout.update_weights(
+                        per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps
+                    )
 
-        await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
-        )
+            with _pub.span('consume_update_weights'):
+                await self.rollout.update_weights(
+                    per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+                )
 
-        log_gpu_memory_usage("After update_weights", logger=logger)
+            log_gpu_memory_usage("After update_weights", logger=logger)
 
-        # 3. offload model to cpu
-        if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        if publication_opt or getattr(self.actor.engine, "overlap_actor_execution", None) is not None:
-            # Export allocates full-weight buffers after the pre-publication
-            # cleanup. Return their cached memory before vLLM restores its KV
-            # cache, and wait for every colocated Actor rank to do the same.
-            # Publication optimization needs this for normal/early Actor too.
-            get_torch_device().synchronize()
-            get_torch_device().empty_cache()
-            torch.distributed.barrier(group=self.actor.engine.get_data_parallel_group())
-        else:
-            aggressive_empty_cache(force_sync=True)
+            # 3. offload model to cpu
+            if self.actor.engine.is_param_offload_enabled:
+                with _pub.span('optional_offload'):
+                    self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            if publication_opt or getattr(self.actor.engine, "overlap_actor_execution", None) is not None:
+                # Export allocates full-weight buffers after the pre-publication
+                # cleanup. Return their cached memory before vLLM restores its KV
+                # cache, and wait for every colocated Actor rank to do the same.
+                # Publication optimization needs this for normal/early Actor too.
+                with _pub.span('existing_synchronize'):
+                    get_torch_device().synchronize()
+                with _pub.span('existing_empty_cache'):
+                    get_torch_device().empty_cache()
+                with _pub.span('existing_dp_barrier'):
+                    torch.distributed.barrier(group=self.actor.engine.get_data_parallel_group())
+            else:
+                with _pub.span('cleanup'):
+                    aggressive_empty_cache(force_sync=True)
 
-        # 4. resume kv_cache
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
-        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+            # 4. resume kv_cache
+            if self.config.rollout.free_cache_engine:
+                with _pub.span('resume_kv'):
+                    await self.rollout.resume(tags=["kv_cache"])
+            log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
-        self.base_sync_done = True
-        set_expandable_segments(True)
+            self.base_sync_done = True
+            set_expandable_segments(True)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
