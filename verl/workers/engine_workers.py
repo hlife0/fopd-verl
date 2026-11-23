@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import functools
 import gc
 import logging
@@ -436,11 +437,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                                 normalized_loss_keys.add(key)
                             output[key] = val.aggregate()
                     append_to_dict(metrics, output)
+                # SUM metrics are already normalized by the logical batch.
+                # Add chunk contributions even when normalization was supplied
+                # directly in batch_num_tokens_override rather than delayed.
+                metric_scale = normalization_scale if normalization_scale is not None else 1.0
+                for key in normalized_loss_keys & metrics.keys():
+                    metrics[key] = sum(metrics[key]) * metric_scale
                 if normalization_scale is not None:
-                    # SUM metrics are global loss contributions, just like loss.
-                    # A mean across chunks would depend on the streaming schedule.
-                    for key in normalized_loss_keys & metrics.keys():
-                        metrics[key] = sum(metrics[key]) * normalization_scale
                     metrics["loss_token_count"] = loss_tokens
                 if grad_norm is not None:
                     metrics["grad_norm"] = grad_norm
@@ -483,6 +486,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 forward_only=False,
                 images_seqlens=tu.get(data, key="images_seqlens", default=None),
             ).cpu()
+            if opd_timeline.enabled(opd_timeline.context().get("step")):
+                denominator = tu.get(data, key="batch_num_tokens_override", default=None)
+                contribution = tu.get(processed, "metrics")["loss"]
+                opd_timeline.emit(
+                    "actor.loss_contribution", loss_contribution=contribution,
+                    loss_denominator=denominator,
+                    loss_numerator=contribution * denominator if denominator is not None else None,
+                )
             tu.get(processed, "metrics").update(
                 chunk_fb_s=timer.last,
                 chunk_fb_start_ts=chunk_fb_start_ts,
@@ -876,6 +887,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     # is the one a torch.profiler.schedule sub-samples (other stages stay full).
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
+    @opd_timeline.observed("actor.batch", "actor", coarse=False)
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
@@ -896,11 +908,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
+    @opd_timeline.observed("actor.batch", "actor", coarse=False)
     def accumulate_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.accumulate_held_train(data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @opd_timeline.observed("actor.finish", "actor", coarse=False)
     def finish_actor_accumulate(self, student_done_ts=None):
         execution = getattr(self.actor.engine, "overlap_actor_execution", None)
         if execution is not None:
@@ -925,6 +939,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    @opd_timeline.observed("weights.publish", "actor", coarse=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.
 
@@ -1017,7 +1032,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        if not publication_opt:
+        if publication_opt or getattr(self.actor.engine, "overlap_actor_execution", None) is not None:
+            # Export allocates full-weight buffers after the pre-publication
+            # cleanup. Return their cached memory before vLLM restores its KV
+            # cache, and wait for every colocated Actor rank to do the same.
+            # Publication optimization needs this for normal/early Actor too.
+            get_torch_device().synchronize()
+            get_torch_device().empty_cache()
+            torch.distributed.barrier(group=self.actor.engine.get_data_parallel_group())
+        else:
             aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache

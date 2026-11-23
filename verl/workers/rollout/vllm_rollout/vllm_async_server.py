@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_timeline
 import argparse
 import asyncio
 import inspect
@@ -557,6 +558,7 @@ class vLLMHttpServer:
         self.task = asyncio.create_task(asyncio.to_thread(run_headless_wrapper))
         self.task.add_done_callback(on_run_headless_done)
 
+    @opd_timeline.observed("server.request", "inherit", coarse=False)
     async def generate(
         self,
         prompt_ids: list[int],
@@ -568,6 +570,7 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
+        timeline_context: Optional[dict] = None,
         token_notify_actor: Optional[ActorHandle] = None,
         token_notify_key: Optional[str] = None,
     ) -> TokenOutput:
@@ -680,6 +683,8 @@ class vLLMHttpServer:
         self._admitting += 1
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
+            opd_timeline.emit("server.engine_submit", request_id=request_id)
+            _timeline_first_output = opd_timeline.enabled(opd_timeline.context().get("step"))
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -695,6 +700,9 @@ class vLLMHttpServer:
             student_first_token_ts = None
             try:
                 async for output in generator:
+                    if _timeline_first_output and output.outputs and output.outputs[0].token_ids:
+                        opd_timeline.emit("server.first_output", engine_request_id=output.request_id)
+                        _timeline_first_output = False
                     if not admitted:
                         admitted = True
                         self._admitting -= 1
@@ -715,6 +723,7 @@ class vLLMHttpServer:
             finally:
                 if not admitted:
                     self._admitting -= 1
+            opd_timeline.emit("server.engine_complete", request_id=request_id, engine_request_id=getattr(final_res, "request_id", None))
             assert final_res is not None
             student_last_token_ts = time.time()
 
@@ -892,6 +901,7 @@ class vLLMHttpServer:
             kv_transfer_params=decode_kv_params,
         )
 
+    @opd_timeline.observed("kv.server_wake", "rollout", coarse=False)
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
             return
@@ -913,6 +923,7 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
+    @opd_timeline.observed("kv.server_sleep", "rollout", coarse=False)
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
@@ -1396,6 +1407,11 @@ class vLLMReplica(RolloutReplica):
                 **get_platform().rollout_env_vars(),
             }
 
+            if opd_timeline.enabled():
+                env_vars["FOPD_TIMELINE_ROLE"] = "teacher" if self.is_teacher_model else "student"
+            for env_key in ("FOPD_MM_SHAPE_DIR", "FOPD_MM_SHAPE_MAX", "FOPD_MM_SHAPE_NVTX"):
+                if env_key in os.environ:
+                    env_vars[env_key] = os.environ[env_key]
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
