@@ -362,7 +362,12 @@ class PPOTrainerSync(PPOTrainer):
                     student_barrier_reached = True
                 ready = [key for key in teacher_ready if key not in consumed]
                 remaining = sample_batch_size - len(consumed)
-                take_n = min(len(ready), chunk_cap)
+                if getattr(self, "separate_rollout", False):
+                    # Every teacher-ready trajectory goes into this call. The engine
+                    # still splits it into token-limited microbatches.
+                    take_n = len(ready)
+                else:
+                    take_n = min(len(ready), chunk_cap)
                 # Only the final chunk may need synthetic zero-loss padding.
                 if len(ready) < remaining:
                     take_n -= take_n % dp_size
