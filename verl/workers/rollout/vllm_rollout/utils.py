@@ -80,6 +80,34 @@ def set_death_signal():
         os.kill(os.getpid(), signal.SIGKILL)
 
 
+def tolerate_vllm_sleep_memory_assert():
+    """FOPD_VLLM_SLEEP_ASSERT_WARN=1: log instead of raise when vLLM Worker.sleep finds that
+    device-wide free memory dropped during the sleep.
+
+    On GPUs shared with other processes (fused placement: the Teacher scoring while the
+    Student sleeps at its barrier), another process allocating during the sleep trips this
+    assert although the sleep itself has completed; only a log line follows it in vLLM.
+    """
+    from vllm.v1.worker import gpu_worker
+
+    original = gpu_worker.Worker.sleep
+    if getattr(original, "_verl_tolerates_memory_assert", False):
+        return
+
+    def sleep(self, level=1):
+        try:
+            return original(self, level)
+        except AssertionError as exc:
+            if "Memory usage increased after sleeping" not in str(exc):
+                raise
+            logger.warning(
+                "vLLM sleep: pid %s ignored %r (another process allocated during the sleep)", os.getpid(), exc
+            )
+
+    sleep._verl_tolerates_memory_assert = True
+    gpu_worker.Worker.sleep = sleep
+
+
 def get_vllm_max_lora_rank(lora_rank: int):
     """
     For vLLM, automatically adjusts the `max_lora_rank` to the nearest allowed value.
@@ -187,6 +215,8 @@ class vLLMColocateWorkerExtension:
         from verl.utils.green_context import install_vllm_green_hook
 
         install_vllm_green_hook()
+        if os.environ.get("FOPD_VLLM_SLEEP_ASSERT_WARN") == "1":
+            tolerate_vllm_sleep_memory_assert()
 
         if os.environ.get("VERL_FULL_DETERMINISM", "0") == "1":
             from verl.workers.engine.utils import enable_full_determinism
