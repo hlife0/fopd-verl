@@ -98,6 +98,22 @@ def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bo
     return logits / temperature.clamp(min=1e-8).to(logits.dtype)
 
 
+def overlap_microbatch_token_limit(data, original_limit, dp_group):
+    """Agree on an atomic-sequence budget before entering FSDP collectives.
+
+    The balancing utility compares a global maximum length against this limit.
+    A rank-local limit would let some ranks raise while others enter its next
+    all-reduce. Make both the limit and an over-length failure collective.
+    """
+    longest = torch.tensor(max(x.numel() for x in data["input_ids"].unbind()),
+                           dtype=torch.int64, device=get_device_id())
+    torch.distributed.all_reduce(longest, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+    limit = max(4096, int(longest.item()))
+    if limit > int(original_limit):
+        raise ValueError("A sequence exceeds the original Actor token budget on at least one rank")
+    return limit
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -762,8 +778,8 @@ class FSDPEngine(BaseEngine):
             original_limit = data["max_token_len_per_gpu"]
             # Samples remain atomic. A long sequence raises the cap rather
             # than truncating context or changing its training loss.
-            longest = max(x.numel() for x in data["input_ids"].unbind())
-            tu.assign_non_tensor(data, max_token_len_per_gpu=min(original_limit, max(4096, longest)))
+            limit = overlap_microbatch_token_limit(data, original_limit, self.get_data_parallel_group())
+            tu.assign_non_tensor(data, max_token_len_per_gpu=limit)
         try:
             micro_batches, indices = prepare_micro_batches(
                 data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
