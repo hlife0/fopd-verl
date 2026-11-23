@@ -192,6 +192,9 @@ class RolloutConfig(BaseConfig):
     # colocated Student replicas to discard old weights instead of backing up
     # and restoring them. Frozen Teachers keep the default level-1 behavior.
     colocated_full_weight_sync: bool = False
+    # Frozen colocated inference: release KV allocations but retain GPU weights.
+    # Currently supported by the CUDA vLLM worker extension with DP=1.
+    sleep_keep_weights: bool = False
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2

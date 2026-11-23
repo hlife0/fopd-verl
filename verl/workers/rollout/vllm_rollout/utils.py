@@ -140,6 +140,46 @@ class vLLMColocateWorkerExtension:
     2. Online FP8 quantization
     """
 
+    def sleep_kv_cache_only(self):
+        """Unmap only KV memory after requests drain; frozen weights stay resident."""
+        from vllm.device_allocator.cumem import CuMemAllocator, unmap_and_release
+
+        if getattr(self, "_kv_only_sleeping", False):
+            return
+        allocator = CuMemAllocator.get_instance()
+        entries = list(allocator.pointer_to_data.values())
+        kv = [entry for entry in entries if entry.tag == "kv_cache"]
+        if not kv or any(entry.cpu_backup_tensor is not None for entry in entries):
+            raise RuntimeError("KV-only sleep requires awake CuMem weights and initialized KV allocations")
+        torch.cuda.synchronize()
+        before = torch.cuda.mem_get_info()[0]
+        self._kv_only_sleeping = True
+        self._kv_only_unmapped = []
+        for entry in kv:
+            unmap_and_release(entry.handle)
+            self._kv_only_unmapped.append(entry.handle)
+        torch.cuda.empty_cache()
+        logger.warning(
+            "KV-only sleep: retained weights %.3f GiB, released KV %.3f GiB, GPU free %.3f -> %.3f GiB",
+            sum(e.handle[1] for e in entries if e.tag == "weights") / 1024**3,
+            sum(e.handle[1] for e in kv) / 1024**3,
+            before / 1024**3,
+            torch.cuda.mem_get_info()[0] / 1024**3,
+        )
+
+    def wake_kv_cache_only(self):
+        """Remap empty KV storage without touching the resident model weights."""
+        from vllm.device_allocator.cumem import create_and_map
+
+        # Initial publication can wake an already-awake Teacher.
+        if not getattr(self, "_kv_only_sleeping", False):
+            return
+        while self._kv_only_unmapped:
+            create_and_map(self._kv_only_unmapped[-1])
+            self._kv_only_unmapped.pop()
+        self.model_runner.post_kv_cache_wake_up()
+        self._kv_only_sleeping = False
+
     def __new__(cls, **kwargs):
         set_death_signal()
 

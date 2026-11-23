@@ -479,6 +479,7 @@ def test_colocated_vllm_wakes_only_requested_memory():
     server = SimpleNamespace(
         node_rank=0,
         rollout_mode=RolloutMode.COLOCATED,
+        config=SimpleNamespace(sleep_keep_weights=False),
         engine=SimpleNamespace(wake_up=AsyncMock(), reset_prefix_cache=AsyncMock()),
         _get_wake_up_tags=lambda: ["weights", "kv_cache"],
     )
