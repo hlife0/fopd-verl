@@ -114,6 +114,14 @@ def test_no_wait_sleep_config_enabled(config):
     assert trainer.resource_pool_manager.resource_pool_spec == {"global_pool": [3]}
 
 
+def test_step_end_exposes_publication_metrics_once(config):
+    trainer = make_trainer(config)
+    trainer._publish_actor_weights = lambda: {"weight_publication/export_s": 0.5}
+    trainer.on_step_end()
+    assert trainer._consume_sync_metrics() == {"weight_publication/export_s": 0.5}
+    assert trainer._consume_sync_metrics() == {}
+
+
 def test_multiple_batches_per_publication_rejected(config):
     OmegaConf.update(config, "trainer.v1.sync.parameter_sync_step", 2, force_add=True)
     with pytest.raises(ValueError, match="parameter_sync_step=1"):

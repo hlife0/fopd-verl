@@ -969,8 +969,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 return metrics or {}
+            export_start = time.perf_counter()
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            export_done = time.perf_counter()
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            if getattr(self, "rank", 0) == 0:
+                metrics = dict(metrics or {})
+                # Host intervals: lazy export work is included in send_s.
+                metrics["weight_publication/export_s"] = export_done - export_start
+                metrics["weight_publication/send_s"] = time.perf_counter() - export_done
             return metrics or {}
 
         set_expandable_segments(False)

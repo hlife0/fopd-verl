@@ -614,7 +614,7 @@ class PPOTrainerSync(PPOTrainer):
         self._trace_weights_start_ts = time.time()
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
-            self._publish_actor_weights()
+            self._pending_sync_metrics = self._publish_actor_weights()
         self._trace_weights_done_ts = time.time()
 
     def on_sample_end(self):
