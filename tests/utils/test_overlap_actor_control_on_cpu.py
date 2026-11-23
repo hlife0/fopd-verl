@@ -37,8 +37,8 @@ def test_step_phase_is_monotonic_and_cancelled_steps_cannot_resume():
         control.cancel(1)
 
 
-def test_mps_requires_actual_client_and_uncapped_server(monkeypatch):
-    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/test-overlap-mps")
+def test_mps_requires_actual_client_and_uncapped_server(monkeypatch, tmp_path):
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", str(tmp_path))
     for key in ("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "FOPD_MPS_ACTOR_PERCENT", "CUDA_MPS_SM_PARTITION"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr("verl.utils.overlap_actor.os.getpid", lambda: 42)
@@ -64,3 +64,39 @@ def test_mps_requires_actual_client_and_uncapped_server(monkeypatch):
     monkeypatch.delenv("CUDA_MPS_PIPE_DIRECTORY")
     with pytest.raises(RuntimeError, match="requires an active MPS"):
         check_mps_client()
+
+
+def test_mps_control_queries_do_not_overlap(monkeypatch, tmp_path):
+    import os
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", str(tmp_path))
+    for key in ("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "FOPD_MPS_ACTOR_PERCENT", "CUDA_MPS_SM_PARTITION"):
+        monkeypatch.delenv(key, raising=False)
+    responses = {
+        "get_server_list": "123\n",
+        "get_client_list 123": f"{os.getpid()}\n",
+        "get_active_thread_percentage 123": "100.0\n",
+    }
+    control_busy = threading.Lock()
+    start = threading.Barrier(6)
+
+    def query(*args, **kwargs):
+        assert control_busy.acquire(blocking=False), "concurrent MPS control clients"
+        try:
+            time.sleep(0.005)
+            return SimpleNamespace(stdout=responses[kwargs["input"].strip()])
+        finally:
+            control_busy.release()
+
+    def check():
+        start.wait(timeout=10)
+        check_mps_client()
+
+    monkeypatch.setattr("verl.utils.overlap_actor.subprocess.run", query)
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(check) for _ in range(6)]
+        for future in futures:
+            future.result(timeout=10)
