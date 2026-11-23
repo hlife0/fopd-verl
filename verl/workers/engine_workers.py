@@ -1018,7 +1018,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        if not publication_opt:
+        if publication_opt or getattr(self.actor.engine, "overlap_actor_execution", None) is not None:
+            # Export allocates full-weight buffers after the pre-publication
+            # cleanup. Return their cached memory before vLLM restores its KV
+            # cache, and wait for every colocated Actor rank to do the same.
+            # Publication optimization needs this for normal/early Actor too.
+            get_torch_device().synchronize()
+            get_torch_device().empty_cache()
+            torch.distributed.barrier(group=self.actor.engine.get_data_parallel_group())
+        else:
             aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache
