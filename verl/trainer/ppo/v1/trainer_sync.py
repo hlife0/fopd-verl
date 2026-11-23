@@ -1,3 +1,4 @@
+from verl.utils import readiness_batching as rb
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -423,7 +424,7 @@ class PPOTrainerSync(PPOTrainer):
 
         self._trace_actor_start_ts = time.time()
         with marked_timer("update_actor", timing_raw, color="red"):
-            self.actor_rollout_wg.begin_actor_accumulate()
+            rb.start_capture(self)
             self._trace_fsdp_load_end_ts = time.time()
             try:
                 while len(consumed) < len(traj_keys):
@@ -457,9 +458,10 @@ class PPOTrainerSync(PPOTrainer):
                         chunk.extra_info["timeline_chunk"] = len(chunk_sizes)
                     dispatch_ts = time.time()
                     with opd_timeline.span("actor.dispatch", role="driver", step=self.global_steps, members=list(chunk.keys), chunk=len(chunk_sizes)):
-                        output = self.actor_rollout_wg.accumulate_actor(chunk)
+                        output = rb.capture_group(self, chunk)
                     return_ts = time.time()
                     consumed.update(take)
+                    rb.consumed(self, take, chunk.keys)
                     chunk_sizes.append(take_n)
                     chunk_events.append(
                         {
@@ -474,7 +476,7 @@ class PPOTrainerSync(PPOTrainer):
                     )
                     if is_last:
                         finish_ts = time.time()
-                        output = _first_output(self.actor_rollout_wg.finish_actor_accumulate())
+                        output = _first_output(rb.execute(self))
                         self._trace_actor_finish_end_ts = time.time()
                         self._trace_actor_finish_start_ts = finish_ts
                         finalized = True

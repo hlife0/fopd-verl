@@ -1,3 +1,4 @@
+from verl.utils import readiness_batching as rb
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -222,6 +223,7 @@ class ReplayBuffer:
                     if key not in partition:
                         partition[key] = {}
                     partition[key].update(tag)
+        rb.observe(self)
 
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:

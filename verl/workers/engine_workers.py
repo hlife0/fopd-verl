@@ -1,3 +1,4 @@
+from verl.utils import readiness_batching as rb
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -470,6 +471,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if self._held_loss_normalization_tokens is not None:
             tu.assign_non_tensor(data, batch_num_tokens_override=self._held_loss_normalization_tokens)
             chunk_loss_tokens = data["loss_mask"].sum().detach().to(self._held_loss_tokens)
+        data = rb.before_accumulate(self, data)
         global_token_num = self._global_token_num(data)
         chunk_fb_start_ts = time.time()
         with Timer(name="train_batch", logger=None) as timer:
@@ -503,12 +505,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         else:
             processed = None
         self.profiler.step()
+        rb.after_accumulate(self, processed)
         return processed
 
     def finish_held_train(self):
-        if self._held_train_ctx is None:
-            raise RuntimeError("held train is not open")
-        return self._close_held_train(step=True)
+        raise RuntimeError("readiness diagnostic forbids optimizer finish")
 
     def abort_held_train(self):
         if self._held_train_ctx is None:
@@ -897,6 +898,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.begin_held_train(loss_normalization_tokens=loss_normalization_tokens)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def readiness_begin(self, name, n, denominator):
+        try:
+            return rb.worker_begin(self.actor, name, n, denominator)
+        except BaseException as exc:
+            rb.worker_failure(self.actor, exc)
+            raise
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def readiness_close(self):
+        return rb.worker_close(self.actor)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def configure_overlap_actor(self, sm_fraction: float):
         self.actor.engine.configure_overlap_actor(sm_fraction)
 
@@ -910,7 +923,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=True)
     @opd_timeline.observed("actor.batch", "actor", coarse=False)
     def accumulate_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.accumulate_held_train(data)
+        try:
+            output = self.actor.accumulate_held_train(data)
+        except BaseException as exc:
+            rb.worker_failure(self.actor, exc)
+            raise
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

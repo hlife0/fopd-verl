@@ -1,3 +1,4 @@
+from verl.utils import readiness_batching as rb
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -761,6 +762,7 @@ class FSDPEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
+        rb.record_microbatches(self, indices)
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -826,52 +828,7 @@ class FSDPEngine(BaseEngine):
 
     @opd_timeline.observed("actor.optimizer", "actor", coarse=False)
     def optimizer_step(self):
-        """
-        Clip gradients, skip update if non-finite, and step optimizer.
-
-        Returns:
-            grad_norm (float): Norm of gradients before clipping.
-        """
-        assert self.optimizer_config.clip_grad is not None
-
-        # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__.
-        scaler = getattr(self, "scaler", None)
-
-        # Unscale gradients before clip so the clip threshold is applied to true gradient
-        # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
-        if scaler is not None:
-            scaler.unscale_(self.optimizer)
-
-        if isinstance(self.module, FSDP):
-            grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
-        elif isinstance(self.module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.module.parameters(), max_norm=self.optimizer_config.clip_grad
-            )
-
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
-
-        if scaler is not None:
-            # scaler handles inf/nan skipping internally via _check_inf_per_device.
-            scaler.step(self.optimizer)
-            scaler.update()
-        else:
-            # if grad_norm is not finite, skip the update
-            if not torch.isfinite(grad_norm):
-                print(f"WARN: grad_norm is not finite: {grad_norm}")
-                self.optimizer.zero_grad()
-            else:
-                self.optimizer.step()
-
-        if self._qat_enabled:
-            from verl.utils.qat.core import invalidate_all_scales
-
-            invalidate_all_scales(self.module)
-
-        return grad_norm.item()
+        raise RuntimeError("isolated readiness runtime forbids optimizer updates")
 
     def lr_scheduler_step(self):
         """
