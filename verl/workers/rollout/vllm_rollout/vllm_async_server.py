@@ -1259,7 +1259,9 @@ class vLLMHttpServer:
             and getattr(mtp_config, "enable", False)
             and getattr(mtp_config, "enable_rollout", False)
         )
-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        # EAGLE drafter weights are not restored by Actor publication.
+        speculative_config = getattr(getattr(self.engine, "vllm_config", None), "speculative_config", None)
+        if speculative_config is not None or mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
             return 1
         return 2
 

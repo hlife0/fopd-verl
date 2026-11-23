@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from verl.utils import opd_e2e_timer
 import json
 import logging
 import math
@@ -1437,6 +1438,7 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        opd_e2e_timer.rollout_start(self.global_steps, len(batch))
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(

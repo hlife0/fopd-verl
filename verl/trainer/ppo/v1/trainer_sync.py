@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.utils import opd_e2e_timer
 import logging
 import os
 
@@ -32,6 +33,7 @@ class PPOTrainerSync(PPOTrainer):
         # update weights after loading checkpoint
         self.checkpoint_manager.update_weights(self.global_steps)
 
+    @opd_e2e_timer.finish
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
